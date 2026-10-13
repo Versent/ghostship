@@ -107,20 +107,59 @@ UNAUTHENTICATED  ──[POST /login]──►  PENDING  ──[GET /login → co
 
 ---
 
-## Claude OAuth login (TRN-170)
+## Claude headless auth (recommended)
+
+For unattended and server deployments, give the transport a long-lived Claude token
+instead of logging in through the browser. The token comes from `claude setup-token`,
+which you run once on your own machine. It is delivered like `KIRO_API_KEY`: set in
+`ghostship.conf`, stored as the Podman secret `ga-claude-code-oauth-token`, and injected
+into each Claude-backend crew as `CLAUDE_CODE_OAUTH_TOKEN`. Every crew uses the same
+token, so the OAuth refresh problem described under
+[Re-authenticate](#re-authenticate) does not apply.
+
+### Prerequisites
+
+Enable the Claude backend by adding `claude` to `GA_CREW_AGENT` in your
+`ghostship.conf`.
+
+### Authenticate
+
+1. On your own machine, run `claude setup-token`, approve in the browser, and copy
+   the token it prints.
+2. Add it to `ghostship.conf`:
+
+   ```bash
+   CLAUDE_CODE_OAUTH_TOKEN="<token>"
+   ```
+
+3. Re-run `ghostship install`. New Claude-backend crews launch without a login
+   prompt.
+
+`install.sh` ignores a `CLAUDE_CODE_OAUTH_TOKEN` exported in your shell. Only the
+value in `ghostship.conf` is used.
+
+### Rotate
+
+The token is long-lived but does expire. When crews start failing Claude auth, run
+`claude setup-token` again, replace the value in `ghostship.conf`, and re-run
+`ghostship install`. The token is fixed in a crew's environment when the crew is
+created, so evac and relaunch existing Claude-backend crews to pick up the new one.
+
+## Claude OAuth login (interactive)
 
 `ga-claude-auth` is a tar archive of `~/.claude/` (the credential directory written
 by the `claude` CLI), stored at `DATA_DIR/ga-claude-auth` (mode `0600`).
 
-This path is an alternative to `GA_CREW_ANTHROPIC_API_KEY` for operators with a
+This path is an alternative to `ANTHROPIC_API_KEY` for operators with a
 Claude Pro/Max subscription who prefer not to maintain a separate API-tier account.
+For unattended or server deployments, prefer the headless auth path above.
 
 ### Prerequisites
 
-1. Enable the Claude backend: add `claude` to `GA_AGENT_BACKENDS` in your
+1. Enable the Claude backend: add `claude` to `GA_CREW_AGENT` in your
    `ghostship.conf` and re-run `ghostship install`, which builds the `claude` CLI
    into the crew image.
-2. To make Claude the default for new crews, also set `GA_CREW_ACP_BACKEND=claude`.
+2. To make Claude the default for new crews, also set `GA_CREW_AGENT=claude` (deprecated alias: `GA_CREW_ACP_BACKEND=claude`).
    Login works whenever `claude` is enabled, even while another backend is the
    default.
 
@@ -175,7 +214,12 @@ injected at setup time.
 
 ### Re-authenticate
 
-Claude OAuth tokens may expire. To refresh:
+Claude OAuth tokens obtained via this flow may expire. Each crew gets its own copy
+of `ga-claude-auth`, and the first crew to refresh the token can leave the stored
+copy stale for crews launched later. The headless token path above does not have
+this limitation.
+
+To refresh an OAuth token:
 
 ```bash
 # Clear the old credential
@@ -197,13 +241,22 @@ after logging in again.
 
 ### Credential precedence
 
-When both `GA_CREW_ANTHROPIC_API_KEY` and `ga-claude-auth` are present, the API key
-takes precedence. OAuth credentials are only used when the API key is unset.
+Each Claude-backend crew gets exactly one credential, chosen in this order:
+
+1. `ANTHROPIC_API_KEY`.
+2. `CLAUDE_CODE_OAUTH_TOKEN`.
+3. `ga-claude-auth`, copied into the crew's `~/.claude/`.
+
+The two settings are passed to the crew under the same names. Before TRN-226 the
+API key setting was `GA_CREW_ANTHROPIC_API_KEY`; that name still works with a
+deprecation warning.
+
+A lower entry is only used when every entry above it is unset.
 
 ### Claude OAuth API
 
 Four HTTP endpoints on the MCP port. Require `Authorization: Bearer <key>` when
-`GA_API_KEY` is set. Available only while `claude` is in `GA_AGENT_BACKENDS`; otherwise `POST /login/claude` and `POST /login/claude/code` return 400 naming `GA_AGENT_BACKENDS`. Logout always works.
+`GA_API_KEY` is set. Available only while `claude` is in `GA_CREW_AGENT`; otherwise `POST /login/claude` and `POST /login/claude/code` return 400 naming `GA_CREW_AGENT`. Logout always works.
 
 ```
 UNAUTHENTICATED  ──[POST /login/claude]──►  PENDING  ──[POST /login/claude/code]──►  CODE SUBMITTED  ──[GET /login/claude → complete]──►  AUTHENTICATED
@@ -236,15 +289,15 @@ every running Claude-backend crew. Returns 409 if not authenticated via OAuth.
 `auth.json`, written by the Codex login flow), stored at `DATA_DIR/ga-codex-auth`
 (mode `0600`).
 
-This path is an alternative to `GA_CREW_OPENAI_API_KEY` for operators with a
+This path is an alternative to `OPENAI_API_KEY` for operators with a
 ChatGPT subscription who prefer not to maintain a separate API-tier account.
 
 ### Prerequisites
 
-1. Enable the Codex backend: add `codex` to `GA_AGENT_BACKENDS` in your
+1. Enable the Codex backend: add `codex` to `GA_CREW_AGENT` in your
    `ghostship.conf` and re-run `ghostship install`, which builds the `codex-acp`
    adapter into the crew image (ONE package — it ships its own Codex binary).
-2. To make Codex the default for new crews, also set `GA_CREW_ACP_BACKEND=codex`.
+2. To make Codex the default for new crews, also set `GA_CREW_AGENT=codex` (deprecated alias: `GA_CREW_ACP_BACKEND=codex`).
    Login works whenever `codex` is enabled, even while another backend is the
    default.
 
@@ -304,13 +357,13 @@ after logging in again.
 
 ### Credential precedence
 
-When both `GA_CREW_OPENAI_API_KEY` and `ga-codex-auth` are present, the API key
+When both `OPENAI_API_KEY` and `ga-codex-auth` are present, the API key
 takes precedence. OAuth credentials are only used when the API key is unset.
 
 ### Codex OAuth API
 
 Three HTTP endpoints on the MCP port. Require `Authorization: Bearer <key>` when
-`GA_API_KEY` is set. Available only while `codex` is in `GA_AGENT_BACKENDS`; otherwise `POST /login/codex` returns 400 naming `GA_AGENT_BACKENDS`. Logout always works.
+`GA_API_KEY` is set. Available only while `codex` is in `GA_CREW_AGENT`; otherwise `POST /login/codex` returns 400 naming `GA_CREW_AGENT`. Logout always works.
 
 ```
 UNAUTHENTICATED  ──[POST /login/codex]──►  PENDING  ──[GET /login/codex → complete]──►  AUTHENTICATED
@@ -321,7 +374,7 @@ UNAUTHENTICATED  ──[POST /login/codex]──►  PENDING  ──[GET /login/
 **`POST /login/codex`** — starts the Codex OAuth login flow inside an ephemeral
 `ga-codex-login-*` container. Returns `{"status": "pending", "login_url": "..."}`.
 Returns 409 if already authenticated or a flow is in progress, and 400 if
-`codex` is not in `GA_AGENT_BACKENDS`.
+`codex` is not in `GA_CREW_AGENT`.
 
 **`GET /login/codex`** — polls completion. On success writes `ga-codex-auth` and
 returns `{"status": "complete"}`. Returns `{"status": "pending"}` while waiting.
@@ -358,6 +411,8 @@ Every standing order written to `/var/mail/captain` carries an `X-Admiral-Sig:` 
 **Residual risk — replay:** a correctly signed order can be re-delivered verbatim and will still verify. Signature validity proves authenticity of origin, not freshness.
 
 **Policy signing:** a separate `policy_signing_key` signs `security_policy.json` via HMAC-SHA256. A tampered policy causes a mismatch and the gateway refuses to start. `policy_signing_key` is distinct from the Admiral seed — an agent reading `admission_policy.json` cannot forge Admiral standing orders.
+
+**SEL signing key (KiroCrew 0.9.0+):** the Security Event Log (SEL) signing key is a **KiroCrew gateway-internal credential** and, as of KiroCrew 0.9.0, lives under `$KIROCREW_HOME/trust/` (the consolidated trust root the 0.9.0 governance work introduced). ghostship does not read, sign with, or verify against the SEL key today. If a future feature needs to read or verify SEL audit entries, it MUST resolve the key under `$KIROCREW_HOME/trust/` — never a hardcoded pre-0.9.0 location. Do not confuse the SEL key with ghostship's own `.local_secret` (the gateway's internal-API secret, used by `transport/lifecycle.py` for dashboard-cookie writes) or `policy_signing_key` (ghostship's own policy HMAC key). A static guardrail test (`tests/unit/test_trn_221_no_hardcoded_sel_path.py`) fails CI if a pre-0.9.0 SEL path literal is reintroduced under `transport/`. See TRN-221 (`trn-221-kc090-sel-key-trust-dir`).
 
 **Storage:** `crews.json` stores only a non-reversible `sha256:<hex[:16]>` identifier for each secret. The Admiral Ed25519 private seed is persisted to `DATA_DIR/secrets/<crew_id>` (mode `0600`) so the transport can sign standing orders after launch.
 

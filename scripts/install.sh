@@ -74,14 +74,27 @@ GA_CREW_AGENT=kiro
 # always enabled. Drives the image toolchains and the transport (TRN-202).
 GA_AGENT_BACKENDS=""
 GA_CREW_ACP_BACKEND=kiro
-GA_CREW_ANTHROPIC_API_KEY=""
 # Crew model backend keys and the headless kiro key. Config-file vars (set in
 # ghostship.conf), not flags — passing a key on the command line would leak it
 # into the process list and shell history. install.sh delivers each as a Podman
 # secret (ga-crew-*-api-key / ga-kiro-api-key) rather than a plaintext compose
-# env var (secret-delivery-hardening).
-GA_CREW_OPENAI_API_KEY=""
+# env var (secret-delivery-hardening). These use the standard names the Claude
+# and Codex CLIs read (TRN-226); resetting them here is what stops a key
+# exported in the operator's own shell from being picked up.
+ANTHROPIC_API_KEY=""
+OPENAI_API_KEY=""
 KIRO_API_KEY=""
+# Long-lived Claude token from `claude setup-token`, injected into Claude-backend
+# crews as CLAUDE_CODE_OAUTH_TOKEN (TRN-226). Reset here so a token exported in
+# the operator's own shell is never picked up; only ghostship.conf sets it.
+CLAUDE_CODE_OAUTH_TOKEN=""
+ANTHROPIC_BASE_URL=""
+OPENAI_BASE_URL=""
+# Deprecated pre-TRN-226 names, still accepted from ghostship.conf (mapped below).
+GA_CREW_ANTHROPIC_API_KEY=""
+GA_CREW_ANTHROPIC_BASE_URL=""
+GA_CREW_OPENAI_API_KEY=""
+GA_CREW_OPENAI_BASE_URL=""
 GA_MIN_FREE_MEM_GB=2.0
 GA_SPAWN_MIN_MEMORY_GB=1.5
 GA_RESOURCE_PRESSURE_GB=2.0
@@ -89,8 +102,22 @@ GA_RESOURCE_CRITICAL_GB=1.0
 GA_GIT_AUTHOR_NAME=""
 GA_GIT_AUTHOR_EMAIL=""
 GA_DASHBOARD_PORT_RANGE_START=64058
-# GA_DASHBOARD_DEFAULT=false  # Set true to allocate a dashboard on every launch
-GA_DASHBOARD_PORT_RANGE_SIZE=1024
+GA_DASHBOARD_DEFAULT=false  # Set true to allocate a dashboard on every launch
+GA_DASHBOARD_PORT_RANGE_SIZE=64
+HOST=0.0.0.0
+GA_ORDERS_DIR=""
+GA_TLS_CERTFILE=""
+GA_TLS_KEYFILE=""
+KC_BASE_IMAGE=""
+GA_PORTAL_SESSION_TTL_SECS=86400
+GA_RATE_LIMIT_ENABLED=true
+GA_RATE_LIMIT_LOGIN_GET=30:60
+GA_RATE_LIMIT_LOGIN_POST=5:300
+GA_RATE_LIMIT_MCP=300:60
+GA_RATE_LIMIT_FILES=60:60
+GA_RATE_LIMIT_CREW_API=120:60
+_COMPOSE_RETRY_ATTEMPTS=3     # retries on transient compose up failure (hardcoded)
+_COMPOSE_RETRY_DELAY_SECS=2   # sleep between retries in seconds (hardcoded)
 # ── Client-only install ──────────────────────────────────────────────────────
 # --client-only wires the ghostship CLI + agent harnesses to a (usually remote)
 # transport WITHOUT running any container-infrastructure steps. --url selects
@@ -235,14 +262,47 @@ if [[ "$CLIENT_ONLY" == "true" ]]; then
   exit 0
 fi
 
-# Normalise GA_AGENT_BACKENDS once; the same value drives the image build
+# ── Model backend setting names (TRN-226) ────────────────────────────────────
+# ANTHROPIC_* / OPENAI_* replace the GA_CREW_-prefixed names. An old name still
+# works for this run with a warning; when both are set, the new name wins.
+for _new in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL OPENAI_API_KEY OPENAI_BASE_URL; do
+  _old="GA_CREW_${_new}"
+  if [[ -n "${!_old:-}" ]]; then
+    echo "  WARNING: ${_old} is deprecated — rename it to ${_new} in ghostship.conf." >&2
+    if [[ -z "${!_new:-}" ]]; then
+      printf -v "$_new" '%s' "${!_old}"
+    else
+      echo "  ${_new} is also set; ignoring ${_old}." >&2
+    fi
+  fi
+done
+unset _new _old
+
+# ── Agent backend consolidation (TRN-213) ────────────────────────────────────
+# GA_CREW_AGENT replaces GA_AGENT_BACKENDS + GA_CREW_ACP_BACKEND.
+# Deprecated alias handling: map old vars to GA_CREW_AGENT with a warning.
+if [[ -n "${GA_AGENT_BACKENDS:-}" ]]; then
+  echo "  WARNING: GA_AGENT_BACKENDS is deprecated — use GA_CREW_AGENT instead." >&2
+  echo "  Mapping GA_AGENT_BACKENDS=${GA_AGENT_BACKENDS} → GA_CREW_AGENT for this run." >&2
+  if [[ -z "${GA_CREW_AGENT:-}" || "${GA_CREW_AGENT}" == "kiro" ]]; then
+    GA_CREW_AGENT="${GA_AGENT_BACKENDS}"
+  fi
+fi
+if [[ -n "${GA_CREW_ACP_BACKEND:-}" && "${GA_CREW_ACP_BACKEND}" != "kiro" ]]; then
+  echo "  WARNING: GA_CREW_ACP_BACKEND is deprecated — use GA_CREW_AGENT instead." >&2
+  echo "  Mapping GA_CREW_ACP_BACKEND=${GA_CREW_ACP_BACKEND} → GA_CREW_AGENT for this run." >&2
+  if [[ -z "${GA_CREW_AGENT:-}" || "${GA_CREW_AGENT}" == "kiro" ]]; then
+    GA_CREW_AGENT="${GA_CREW_ACP_BACKEND}"
+  fi
+fi
+
+# Normalise GA_CREW_AGENT once; the same value drives the image build
 # (AGENT_TOOLCHAINS) and the transport environment. Fail before any build on
-# an unknown name or a default backend that isn't enabled, so a bad config
-# doesn't cost a full build and a restart loop.
-AGENT_TOOLCHAINS="$(agent_backends_normalise "$GA_AGENT_BACKENDS")" || exit 1
+# an unknown name, so a bad config doesn't cost a full build and a restart loop.
+# GA_CREW_AGENT is comma-separated; first entry is the runtime default.
+AGENT_TOOLCHAINS="$(agent_backends_normalise "${GA_CREW_AGENT:-kiro}")" || exit 1
 agent_backends_validate "$AGENT_TOOLCHAINS" "$GHOSTSHIP_DIR/crews/spec-ops/toolchains" || exit 1
-agent_backends_check_default "$GA_CREW_ACP_BACKEND" "$AGENT_TOOLCHAINS" "$GHOSTSHIP_DIR/crews/spec-ops/toolchains" || exit 1
-echo "✓ Agent backends: kiro${AGENT_TOOLCHAINS:+,$AGENT_TOOLCHAINS} (default: ${GA_CREW_ACP_BACKEND})"
+echo "✓ Agent backend: ${GA_CREW_AGENT:-kiro} (runtime default: $(echo "${GA_CREW_AGENT:-kiro}" | cut -d',' -f1))"
 
 if [[ -z "${KIRO_IDENTITY_PROVIDER:-}" && -t 0 ]]; then
   read -rp "kiro-cli identity provider URL (blank = default Builder ID login): " KIRO_IDENTITY_PROVIDER
@@ -700,15 +760,22 @@ fi
 # than plaintext compose env vars (secret-delivery-hardening). Each block is
 # idempotent: remove any prior secret, then recreate only when the value is set.
 ${_PODMAN_CMD} secret rm ga-crew-anthropic-api-key 2>/dev/null || true
-if [[ -n "${GA_CREW_ANTHROPIC_API_KEY:-}" ]]; then
-  printf '%s' "$GA_CREW_ANTHROPIC_API_KEY" | ${_PODMAN_CMD} secret create ga-crew-anthropic-api-key -
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  printf '%s' "$ANTHROPIC_API_KEY" | ${_PODMAN_CMD} secret create ga-crew-anthropic-api-key -
   echo "✓ Podman secret 'ga-crew-anthropic-api-key' created"
+fi
+
+# ── Podman secret for ga-claude-code-oauth-token ──────────────────────────────
+${_PODMAN_CMD} secret rm ga-claude-code-oauth-token 2>/dev/null || true
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+  printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | ${_PODMAN_CMD} secret create ga-claude-code-oauth-token -
+  echo "✓ Podman secret 'ga-claude-code-oauth-token' created"
 fi
 
 # ── Podman secret for ga-crew-openai-api-key ──────────────────────────────────
 ${_PODMAN_CMD} secret rm ga-crew-openai-api-key 2>/dev/null || true
-if [[ -n "${GA_CREW_OPENAI_API_KEY:-}" ]]; then
-  printf '%s' "$GA_CREW_OPENAI_API_KEY" | ${_PODMAN_CMD} secret create ga-crew-openai-api-key -
+if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  printf '%s' "$OPENAI_API_KEY" | ${_PODMAN_CMD} secret create ga-crew-openai-api-key -
   echo "✓ Podman secret 'ga-crew-openai-api-key' created"
 fi
 
@@ -778,12 +845,39 @@ fi
 # Written to DATA_DIR so it is machine-specific (socket path, env vars) and
 # not committed to the repo. start.sh and uninstall.sh both read it.
 
+# ── Pre-compose validation: GA_ORDERS_DIR ────────────────────────────────────
+if [[ -n "${GA_ORDERS_DIR:-}" ]]; then
+  if [[ "${GA_ORDERS_DIR}" != /* ]]; then
+    echo "✗ GA_ORDERS_DIR=${GA_ORDERS_DIR} is not an absolute path. Set it to an absolute path or leave it unset." >&2
+    exit 1
+  fi
+  if [[ ! -e "${GA_ORDERS_DIR}" ]]; then
+    echo "  WARNING: GA_ORDERS_DIR=${GA_ORDERS_DIR} does not exist. The directory will be bind-mounted at runtime; ensure it exists before starting ga-transport." >&2
+  fi
+fi
+
+# ── Pre-compose validation: TLS cert/key ─────────────────────────────────────
+if [[ -n "${GA_TLS_CERTFILE:-}" ]] || [[ -n "${GA_TLS_KEYFILE:-}" ]]; then
+  if [[ -z "${GA_TLS_CERTFILE:-}" ]] || [[ -z "${GA_TLS_KEYFILE:-}" ]]; then
+    echo "✗ GA_TLS_CERTFILE and GA_TLS_KEYFILE must both be set or both be unset." >&2
+    exit 1
+  fi
+  _cert_dir="$(dirname "${GA_TLS_CERTFILE}")"
+  _key_dir="$(dirname "${GA_TLS_KEYFILE}")"
+  if [[ "${_cert_dir}" != "${_key_dir}" ]]; then
+    echo "✗ GA_TLS_CERTFILE and GA_TLS_KEYFILE must be in the same parent directory." >&2
+    echo "  Cert: ${GA_TLS_CERTFILE} (dir: ${_cert_dir})" >&2
+    echo "  Key:  ${GA_TLS_KEYFILE} (dir: ${_key_dir})" >&2
+    exit 1
+  fi
+fi
+
 # Pre-compute UI port range end for the compose template.
 _DASHBOARD_PORT_START="${GA_DASHBOARD_PORT_RANGE_START:-64058}"
-_DASHBOARD_PORT_END=$(( _DASHBOARD_PORT_START + ${GA_DASHBOARD_PORT_RANGE_SIZE:-1024} - 1 ))
+_DASHBOARD_PORT_END=$(( _DASHBOARD_PORT_START + ${GA_DASHBOARD_PORT_RANGE_SIZE:-64} - 1 ))
 
-# compose.yml carries model API keys (GA_CREW_ANTHROPIC_API_KEY,
-# GA_CREW_OPENAI_API_KEY): create it owner-only. chmod as well, because
+# compose.yml carries model API keys (ANTHROPIC_API_KEY,
+# OPENAI_API_KEY): create it owner-only. chmod as well, because
 # rewriting an existing file keeps its old mode.
 _ga_saved_umask="$(umask)"
 umask 077
@@ -810,6 +904,8 @@ services:
       - ${DATA_DIR}/academy/mcp:/mcp:ro
       - ${DATA_DIR}/crews:/crews:ro
       - ${PODMAN_SOCK}:${PODMAN_SOCK}
+$(if [[ -n "${GA_ORDERS_DIR:-}" ]]; then printf '      - %s:/mnt/orders:ro\n' "${GA_ORDERS_DIR}"; fi)
+$(if [[ -n "${GA_TLS_CERTFILE:-}" ]]; then printf '      - %s:/mnt/tls:ro\n' "$(dirname "${GA_TLS_CERTFILE}")"; fi)
     environment:
       PODMAN_SOCKET: ${PODMAN_SOCK}
       HOST: ${HOST:-0.0.0.0}
@@ -819,20 +915,17 @@ services:
       GA_MAX_ACTIVE_CREWS: "${GA_MAX_ACTIVE_CREWS:-3}"
       GA_IDLE_TIMEOUT_SECS: "${GA_IDLE_TIMEOUT_SECS:-300}"
       GA_SUBAGENT_TIMEOUT_SECS: "${GA_SUBAGENT_TIMEOUT_SECS:-3600}"
-      GA_SUBAGENT_MAX_TURNS: "${GA_SUBAGENT_MAX_TURNS:-200}"
       GA_BATCH_MAX_TASKS: "${GA_BATCH_MAX_TASKS:-20}"
       GA_PICKUP_MAX_POLL_SECS: "${GA_PICKUP_MAX_POLL_SECS:-30}"
       GA_CREW_AGENT: "${GA_CREW_AGENT:-kiro}"
-      GA_CREW_ACP_BACKEND: "${GA_CREW_ACP_BACKEND:-kiro}"
-      # Model backend keys (GA_CREW_ANTHROPIC_API_KEY, GA_CREW_OPENAI_API_KEY)
+      # Model backend keys (ANTHROPIC_API_KEY, OPENAI_API_KEY)
       # and KIRO_API_KEY are NOT passed as environment values here — they are
       # delivered to the transport as Podman secrets mounted under /run/secrets
       # (see the secrets: blocks below) so the keys never appear in plaintext in
       # this compose file (secret-delivery-hardening). Only the non-secret base
       # URLs remain in the environment.
-      GA_CREW_ANTHROPIC_BASE_URL: "${GA_CREW_ANTHROPIC_BASE_URL:-}"
-      GA_AGENT_BACKENDS: "${AGENT_TOOLCHAINS}"
-      GA_CREW_OPENAI_BASE_URL: "${GA_CREW_OPENAI_BASE_URL:-}"
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
       KIRO_IDENTITY_PROVIDER: "${KIRO_IDENTITY_PROVIDER:-}"
       KIRO_REGION: "${KIRO_REGION:-}"
       KIRO_LICENSE: "${KIRO_LICENSE:-}"
@@ -844,10 +937,8 @@ services:
       GA_RESOURCE_CRITICAL_GB: "${GA_RESOURCE_CRITICAL_GB:-1.0}"
       GA_GIT_AUTHOR_NAME: "${GA_GIT_AUTHOR_NAME:-}"
       GA_GIT_AUTHOR_EMAIL: "${GA_GIT_AUTHOR_EMAIL:-}"
-      GA_ENABLE_SECURITY_HEADERS: "${GA_ENABLE_SECURITY_HEADERS:-1}"
-      GA_TLS_MIN_VERSION: "${GA_TLS_MIN_VERSION:-1.2}"
-      GA_TLS_CERTFILE: "${GA_TLS_CERTFILE:-}"
-      GA_TLS_KEYFILE: "${GA_TLS_KEYFILE:-}"
+      GA_TLS_CERTFILE: "$(if [[ -n "${GA_TLS_CERTFILE:-}" ]]; then echo "/mnt/tls/$(basename "${GA_TLS_CERTFILE}")"; else echo ""; fi)"
+      GA_TLS_KEYFILE: "$(if [[ -n "${GA_TLS_KEYFILE:-}" ]]; then echo "/mnt/tls/$(basename "${GA_TLS_KEYFILE}")"; else echo ""; fi)"
       GA_RATE_LIMIT_ENABLED: "${GA_RATE_LIMIT_ENABLED:-true}"
       GA_RATE_LIMIT_LOGIN_GET: "${GA_RATE_LIMIT_LOGIN_GET:-30:60}"
       GA_RATE_LIMIT_LOGIN_POST: "${GA_RATE_LIMIT_LOGIN_POST:-5:300}"
@@ -856,17 +947,18 @@ services:
       GA_RATE_LIMIT_CREW_API: "${GA_RATE_LIMIT_CREW_API:-120:60}"
       GA_DASHBOARD_PORT_RANGE_START: "${GA_DASHBOARD_PORT_RANGE_START:-64058}"
       GA_DASHBOARD_DEFAULT: "${GA_DASHBOARD_DEFAULT:-false}"
-      GA_DASHBOARD_PORT_RANGE_SIZE: "${GA_DASHBOARD_PORT_RANGE_SIZE:-1024}"
+      GA_DASHBOARD_PORT_RANGE_SIZE: "${GA_DASHBOARD_PORT_RANGE_SIZE:-64}"
       GA_PORTAL_TLS_MODE: "${GA_PORTAL_TLS_MODE:-off}"
       GA_PORTAL_DOMAIN: "${GA_PORTAL_DOMAIN:-}"
       GA_PORTAL_SESSION_TTL_SECS: "${GA_PORTAL_SESSION_TTL_SECS:-86400}"
-      GA_ORDERS_DIR: "${GA_ORDERS_DIR:-}"
+      GA_ORDERS_DIR: "$(if [[ -n "${GA_ORDERS_DIR:-}" ]]; then echo "/mnt/orders"; else echo ""; fi)"
       GA_REQUIRE_API_KEY: "${GA_REQUIRE_API_KEY:-warn}"
     secrets:
       - ga-transport-secret
 $(if [[ -n "${GA_API_KEY:-}" ]]; then printf '      - ga-api-key\n'; fi)
-$(if [[ -n "${GA_CREW_ANTHROPIC_API_KEY:-}" ]]; then printf '      - ga-crew-anthropic-api-key\n'; fi)
-$(if [[ -n "${GA_CREW_OPENAI_API_KEY:-}" ]]; then printf '      - ga-crew-openai-api-key\n'; fi)
+$(if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then printf '      - ga-crew-anthropic-api-key\n'; fi)
+$(if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then printf '      - ga-claude-code-oauth-token\n'; fi)
+$(if [[ -n "${OPENAI_API_KEY:-}" ]]; then printf '      - ga-crew-openai-api-key\n'; fi)
 $(if [[ -n "${KIRO_API_KEY:-}" ]]; then printf '      - ga-kiro-api-key\n'; fi)
   ga-portal:
     image: docker.io/caddy:2
@@ -893,8 +985,9 @@ secrets:
   ga-transport-secret:
     external: true
 $(if [[ -n "${GA_API_KEY:-}" ]]; then printf '  ga-api-key:\n    external: true\n'; fi)
-$(if [[ -n "${GA_CREW_ANTHROPIC_API_KEY:-}" ]]; then printf '  ga-crew-anthropic-api-key:\n    external: true\n'; fi)
-$(if [[ -n "${GA_CREW_OPENAI_API_KEY:-}" ]]; then printf '  ga-crew-openai-api-key:\n    external: true\n'; fi)
+$(if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then printf '  ga-crew-anthropic-api-key:\n    external: true\n'; fi)
+$(if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then printf '  ga-claude-code-oauth-token:\n    external: true\n'; fi)
+$(if [[ -n "${OPENAI_API_KEY:-}" ]]; then printf '  ga-crew-openai-api-key:\n    external: true\n'; fi)
 $(if [[ -n "${KIRO_API_KEY:-}" ]]; then printf '  ga-kiro-api-key:\n    external: true\n'; fi)
 volumes:
   ga-portal-data:
@@ -995,7 +1088,7 @@ cat > "${DATA_DIR}/caddy/initial-config.json" <<CADDY_EOF
 ${_AUTH_ROUTES}
             {
               "@id": "ga-transport-misc",
-              "match": [{"path": ["/health", "/version", "/openapi.json", "/dashboard/*", "/login", "/login*", "/logout", "/logout*"]}],
+              "match": [{"path": ["/health", "/version", "/openapi.json", "/dashboard/*", "/login", "/login*", "/logout", "/logout*", "/crews/*/captain/stop"]}],
               "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "ga-transport:64057"}], ${_PORTAL_TOKEN_HEADER}}]
             }
           ]
@@ -1065,7 +1158,31 @@ fi
 _COMPOSE_ENV="${_COMPOSE_ENV:+${_COMPOSE_ENV} }PODMAN_COMPOSE_PROVIDER=$(command -v podman-compose)"
 eval "${_COMPOSE_ENV} podman rm -f ga-transport" >/dev/null 2>&1 || true
 eval "${_COMPOSE_ENV} podman rm -f ga-portal" >/dev/null 2>&1 || true
-eval "${_COMPOSE_ENV} podman compose --project-name ga -f \"${DATA_DIR}/compose.yml\" up -d --force-recreate --remove-orphans"
+
+# Retry loop: transient port conflicts (e.g. macOS ephemeral range overlap with
+# the dashboard port space) are typically released within a second or two.
+# _COMPOSE_RETRY_ATTEMPTS (3) and _COMPOSE_RETRY_DELAY_SECS (2) are hardcoded.
+_compose_attempts="${_COMPOSE_RETRY_ATTEMPTS}"
+_compose_delay="${_COMPOSE_RETRY_DELAY_SECS}"
+# Guard: treat 0 or non-integer as 1
+if ! [[ "${_compose_attempts}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "  WARNING: GA_COMPOSE_RETRY_ATTEMPTS='${_compose_attempts}' is not a positive integer — using 1" >&2
+  _compose_attempts=1
+fi
+_compose_ok=0
+for _attempt in $(seq 1 "${_compose_attempts}"); do
+  if eval "${_COMPOSE_ENV} podman compose --project-name ga -f \"${DATA_DIR}/compose.yml\" up -d --force-recreate --remove-orphans"; then
+    _compose_ok=1; break
+  fi
+  if [[ "${_attempt}" -lt "${_compose_attempts}" ]]; then
+    echo "  compose up failed (attempt ${_attempt}/${_compose_attempts}), retrying in ${_compose_delay}s..." >&2
+    sleep "${_compose_delay}"
+  fi
+done
+if [[ "${_compose_ok}" -ne 1 ]]; then
+  echo "✗ compose up failed after ${_compose_attempts} attempt(s)" >&2
+  exit 1
+fi
 echo "✓ ga-transport container started"
 
 if [[ -n "${GA_API_KEY:-}" ]]; then

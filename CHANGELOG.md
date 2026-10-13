@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.7.0
+
+### Breaking changes
+
+- **Removed `POST /login/claude/setup-token` (TRN-226).** The route could never complete. `claude setup-token` asks for an interactive browser approval and prints its token to stdout; it does not write `~/.claude/.credentials.json`, which the route waited for. The route also ran blocking work on the transport's event loop, so a single call hung every other request until the transport was restarted. The route now returns 404. To migrate, run `claude setup-token` on your own machine, set `CLAUDE_CODE_OAUTH_TOKEN="<token>"` in `ghostship.conf`, and re-run `ghostship install`.
+
+### Deprecations
+
+- **Model backend settings use their standard names (TRN-226).** `GA_CREW_ANTHROPIC_API_KEY`, `GA_CREW_ANTHROPIC_BASE_URL`, `GA_CREW_OPENAI_API_KEY` and `GA_CREW_OPENAI_BASE_URL` are now `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_BASE_URL`, the names the Claude and Codex CLIs read. The old names still work from `ghostship.conf`, with a warning at install; when both are set, the new name wins. Values exported in the shell running `install.sh` are ignored under either name. The Podman secret names are unchanged, so existing installs need no migration beyond renaming the lines in `ghostship.conf`.
+
+### Features
+
+- **Headless Claude auth with `CLAUDE_CODE_OAUTH_TOKEN` (TRN-226).** The long-lived token from `claude setup-token` is now set in `ghostship.conf`, delivered as the `ga-claude-code-oauth-token` Podman secret, and injected into Claude-backend crews as `CLAUDE_CODE_OAUTH_TOKEN`. Every crew uses the same token, so the OAuth refresh-staleness limitation (see v0.6.0) does not apply. Each Claude crew gets exactly one credential, in this order: `ANTHROPIC_API_KEY`, then `CLAUDE_CODE_OAUTH_TOKEN`, then `ga-claude-auth`. See [docs/auth.md](docs/auth.md#claude-headless-auth-recommended).
+
+### Fixes
+
+- **API keys now suppress stored OAuth credentials as documented (TRN-226).** `transport/lifecycle.py` read `KIRO_API_KEY` and the Anthropic and OpenAI API keys from environment values that are always empty in production (the keys exist only as Podman secrets). As a result, a crew with an API key still received `ga-kiro-auth`, `ga-claude-auth` or `ga-codex-auth` alongside it. Both `server.py` and `lifecycle.py` now resolve all crew credentials from their secrets through `security.get_secret`, and the inert-setting warning checks the resolved values.
+- **`install.sh` ignores the invoking shell's environment for every setting.** Fifteen settings had no built-in default, so a value exported in the operator's shell (for example `HOST`, the Anthropic base URL, `GA_RATE_LIMIT_ENABLED` or `GA_DASHBOARD_DEFAULT`) reached the transport without being in `ghostship.conf`. All now have defaults equal to their previous fallbacks, so the documented precedence (built-in default, then config file, then CLI flag) holds.
+
+## KiroCrew 0.8.0 → 0.9.0 upgrade
+
+- **TRN-220 — internal-API peer-cred validation (PR #2424) does not affect ghostship; transport uses the cookie path. Guardrail test added.** KiroCrew 0.9.0 (`0.9.0-insider.4`) adds unix-socket peer-credential validation to the gateway's internal-secret API path (`X-Internal-Secret` / `X-Session-Key`): a caller whose OS UID differs from the gateway's `kirocrew` process is now rejected even with a valid shared secret. The transport authenticates to crew gateways on the external dashboard-cookie path only (`Cookie` + `Origin`), so this is a no-op for ghostship today. `transport/lifecycle.py::_crew_api` now documents the invariant, carries `_FORBIDDEN_INTERNAL_HEADERS`, and refuses the internal-secret headers if a caller ever passes them via `headers=`; `tests/unit/test_trn220_crew_api_headers.py` asserts the cookie-only contract so a future change that routes an internal-API call across the UID boundary fails loudly in CI.
+
+- **TRN-221 — SEL signing key moved to `$KIROCREW_HOME/trust/` (PR #2421 / issue #1881) does not affect ghostship. Convention pinned + guardrail test added.** KiroCrew 0.9.0 (`0.9.0-insider.4`) relocates the Security Event Log (SEL) signing key into the new consolidated `$KIROCREW_HOME/trust/` root. The SEL key is a gateway-internal credential; no ghostship transport surface reads, signs with, or verifies against it, so the upgrade works unchanged (behaviour change / low impact — no code change required). A grep audit of `transport/` against the target image confirmed zero SEL-key references (the only hits are the SQL `SELECT` keyword, `session_key_is_attested()`, the `_RAVEN_SELF_CANCEL` text, and the unrelated `.local_secret` docstring). The `$KIROCREW_HOME/trust/` convention for any future SEL-reading feature is documented in [docs/auth.md](docs/auth.md) ("Admiral mail signing"), and `tests/unit/test_trn_221_no_hardcoded_sel_path.py` fails CI if a pre-0.9.0 SEL path literal (`sel_key` / `sel.key` / `/sel/`) is ever reintroduced under `transport/`.
+
+- **TRN-224 — memory retrieval now ranks by vector similarity, not recency (upstream PR #3243). Behaviour change / low impact — no ghostship code change required.** KiroCrew 0.9.0 (`0.9.0-insider.4`) embeds memories at write time and ranks them at retrieval by cosine similarity of the stored vectors against the current turn, replacing 0.8.0's recency ordering. **Operators of long-running crews with accumulated memory should expect task behaviour to shift after the upgrade**, because a different set of memories may be selected for injection into a given turn. The first start after upgrading a crew that already holds pre-0.9.0 memory rows may run a **one-time re-embedding pass** to backfill vector representations, which can briefly delay that first startup on large memory stores (a one-time cost; subsequent starts are unaffected). **Fresh and ephemeral crews (e.g. the spec-ops crew, which starts per-project with no accumulated memory) are unaffected by both the ranking change and the re-embedding pass.** Ghostship touches memory in exactly two places and neither needs changing: `transport/lifecycle.py::_patch_crew_config()` enrolls each agent with `"memory_store": "default"` (a store *selector* carrying no ordering assumption — still valid under 0.9.0), and `crews/_base/graduation/seed_kiro_db.py` seeds only `auth_kv` / `history` / `migrations` / `state` (verified `SELECT COUNT(*), MAX(version) FROM migrations` → `(6, 5)`), creating no `memories` / `lessons` / embedding table — those remain owned by the gateway's own first-start migration.
+
 ## v0.6.0
 
 ### Breaking changes

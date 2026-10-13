@@ -138,11 +138,13 @@ cfg = Config.from_env()
 # When set, kiro-cli in the crew authenticates via this API key (injected
 # as a container env var by server.launch) and the SQLite auth-row injection
 # (_inject_auth) is skipped. Unset (default) => device-code auth is injected.
-KIRO_API_KEY = cfg.kiro_api_key
+# Read from the Podman secret, as server.py does: cfg.kiro_api_key is "" in
+# production because the compose file never carries the key (TRN-226).
+KIRO_API_KEY = _security.get_secret("ga-kiro-api-key", env_var="KIRO_API_KEY")
 
 # The reusable kiro-cli auth blob lives under the transport data mount; the
 # KIRO_* values drive the interactive `kiro-cli login` device flow in _initiate_login.
-DATA_DIR = Path(cfg.transport_data_dir)
+DATA_DIR = Path("/data")
 GA_AUTH_FILE = "ga-kiro-auth"
 KIRO_LICENSE = cfg.kiro_license
 KIRO_IDENTITY_PROVIDER = cfg.kiro_identity_provider
@@ -199,7 +201,11 @@ KC_IMAGE = cfg.kc_image
 # FROM pin in crews/_base/admission/Containerfile.
 GA_MAX_ACTIVE_CREWS = cfg.ga_max_active_crews
 GA_IDLE_TIMEOUT_SECS = cfg.ga_idle_timeout_secs
-GA_CREW_AGENT = cfg.ga_crew_agent
+# KiroCrew agent name written to config.local.json inside each crew.
+# Hardcoded: this is the KiroCrew built-in agent name and is not operator-configurable.
+_KC_AGENT_NAME = "kiro"
+# Retained as GA_CREW_AGENT for existing call sites in _patch_crew_config.
+GA_CREW_AGENT = _KC_AGENT_NAME
 KC_MODEL_OVERRIDE = cfg.kc_model_override
 KC_MODEL_DEFAULT = cfg.kc_model_default
 GA_MIN_FREE_MEM_GB = cfg.ga_min_free_mem_gb
@@ -207,19 +213,32 @@ GA_SPAWN_MIN_MEMORY_GB = cfg.ga_spawn_min_memory_gb
 GA_RESOURCE_PRESSURE_GB = cfg.ga_resource_pressure_gb
 GA_RESOURCE_CRITICAL_GB = cfg.ga_resource_critical_gb
 GA_SUBAGENT_TIMEOUT_SECS = cfg.ga_subagent_timeout_secs
-GA_SUBAGENT_MAX_TURNS = cfg.ga_subagent_max_turns
-GA_PREWARM_ENABLED = cfg.ga_prewarm_enabled
-GA_PREWARM_TTL_SECS = cfg.ga_prewarm_ttl_secs
+# Hardcoded: subagent max turns and prewarm TTL are internal constants.
+_SUBAGENT_MAX_TURNS = 200
+GA_SUBAGENT_MAX_TURNS = _SUBAGENT_MAX_TURNS
+_PREWARM_TTL_SECS = 300
+GA_PREWARM_TTL_SECS = _PREWARM_TTL_SECS
+# GA_PREWARM_ENABLED: prewarm always fires when triggered (gate removed).
+# Retained as a module-level name so tests can patch it for isolation.
+GA_PREWARM_ENABLED = True
 
 # ACP backend selection — controls whether kiro, Claude Code, or Codex runs inside crew containers.
 # "kiro" (default): kiro-cli auth injection path (existing behaviour).
 # "claude": skip kiro auth, inject ANTHROPIC_API_KEY + CLAUDE_CODE_HEADLESS=1.
 # "codex": skip kiro auth, inject OPENAI_API_KEY (or the ga-codex-auth archive).
-GA_CREW_ACP_BACKEND = cfg.ga_crew_acp_backend
-GA_CREW_ANTHROPIC_API_KEY = cfg.ga_crew_anthropic_api_key
-GA_CREW_ANTHROPIC_BASE_URL = cfg.ga_crew_anthropic_base_url
-GA_CREW_OPENAI_API_KEY = cfg.ga_crew_openai_api_key
-GA_CREW_OPENAI_BASE_URL = cfg.ga_crew_openai_base_url
+# GA_CREW_AGENT is the consolidated backend var (replaces GA_CREW_ACP_BACKEND + GA_AGENT_BACKENDS).
+# The runtime default backend is the first entry.
+GA_CREW_ACP_BACKEND = cfg.ga_crew_agent.split(",")[0].strip().lower()
+# Credentials resolve from Podman secrets exactly as in server.py, so the
+# OAuth-injection guards below see the same values the crew env was built from.
+ANTHROPIC_API_KEY = _security.get_secret(
+    "ga-crew-anthropic-api-key", env_var="ANTHROPIC_API_KEY")
+CLAUDE_CODE_OAUTH_TOKEN = _security.get_secret(
+    "ga-claude-code-oauth-token", env_var="CLAUDE_CODE_OAUTH_TOKEN")
+ANTHROPIC_BASE_URL = cfg.anthropic_base_url
+OPENAI_API_KEY = _security.get_secret(
+    "ga-crew-openai-api-key", env_var="OPENAI_API_KEY")
+OPENAI_BASE_URL = cfg.openai_base_url
 
 # The effective crew session idle timeout. Spec-ops crews are patched with a
 # fixed ``session.timeout_secs = 300`` override (see _patch_crew_config); a
@@ -278,7 +297,8 @@ _warm_markers_lock = threading.Lock()
 # Bounded in-process memory: _task_timestamps completed entries are evicted once
 # their completed_at is older than _TASK_TIMESTAMP_TTL_SECS (env-overridable);
 # _warm_markers entries are evicted once older than _WARM_MARKER_TTL_SECS.
-# Both TTLs floor at one hour.
+# The warm-marker TTL is floored at one hour via `_warm_marker_ttl_secs()`;
+# `_TASK_TIMESTAMP_TTL_SECS` has no floor.
 _TASK_TIMESTAMP_TTL_SECS = float(os.environ.get("GA_TASK_TIMESTAMP_TTL_SECS", "3600"))
 
 
@@ -343,11 +363,32 @@ def _write_dashboard_cookie(podman: "PodmanClient", container: str, cookie: str)
         return False
 
 
+# TRN-220: headers the transport host must never send to a crew gateway.
+# These select the gateway's INTERNAL auth path, which KiroCrew 0.9.0
+# (PR #2424 / issue #302) now peer-cred-gates over the unix socket: a caller
+# whose OS UID does not match the gateway's `kirocrew` process is rejected even
+# with a valid shared secret. The transport host runs under a different UID, so
+# any internal-secret call from here would be rejected. The transport always
+# uses the external dashboard-cookie path instead.
+_FORBIDDEN_INTERNAL_HEADERS = ("X-Internal-Secret", "X-Session-Key")
+
+
 def _crew_api(crew: dict, method: str, path: str, **kw: Any) -> Any:
     url = _crew_url(crew)
+    # TRN-220: authenticate on the external cookie path (Cookie + Origin) only.
+    # Never attach the internal-secret headers — see _FORBIDDEN_INTERNAL_HEADERS.
+    headers = {"Cookie": _crew_cookie(crew), "Origin": url}
+    caller_headers = kw.pop("headers", None)
+    if caller_headers:
+        for h in _FORBIDDEN_INTERNAL_HEADERS:
+            if h in caller_headers:
+                raise ValueError(
+                    f"TRN-220: {h} must not be sent on the transport cookie path"
+                )
+        headers.update(caller_headers)
     r = _http.request(
         method, f"{url}{path}",
-        headers={"Cookie": _crew_cookie(crew), "Origin": url},
+        headers=headers,
         **kw,
     )
     r.raise_for_status()
@@ -636,6 +677,11 @@ def _crew_api_with_recovery(
                 # ── Phase 0: transient 503 while task process is still starting ──
                 return _phase0_transient_503(crew, method, path, **kw)
             if status not in (400, 401, 403):
+                raise
+            # ── TRN-230: 400 on /continue means session is gone, not a stale cookie.
+            # Phase-1 cookie refresh cannot recover a finished session — re-raise so
+            # the caller (_steer_captain_checkin) can handle it as "session gone".
+            if status == 400 and "/continue" in path:
                 raise
             # ── Phase 1: stale cookie ─────────────────────────────────────────
             return _phase1_stale_cookie(crew, crew_id, method, path, **kw)
@@ -1008,10 +1054,6 @@ def _prewarm_crew(crew: dict, crew_id: str) -> dict:
     spec/workspace state. The only bookkeeping is the in-memory warm marker and
     whatever _ensure_crew_running already performs for a normal auto-start.
     """
-    # 2.2: opt-in gate — return early when disabled, before any start/fork.
-    if not GA_PREWARM_ENABLED:
-        return {"crew_id": crew_id, "status": "disabled"}
-
     ttl = _effective_prewarm_ttl()
 
     # 2.3: idempotency — a fresh warm marker on a running container is a no-op.
@@ -1684,6 +1726,15 @@ def _reconcile_registry() -> None:
                 _nuke_codex_login_container(podman, cname.lstrip("/"))
     except Exception as e:
         logger.warning("Login container sweep failed: %s", e)
+
+    # Sweep any pending login flows that have exceeded their TTL.  This runs
+    # independently of polling so an abandoned flow does not keep its container
+    # running until the next poll (or until a restart).
+    try:
+        _sweep_expired_logins(podman)
+    except Exception as e:
+        logger.warning("Login expiry sweep failed: %s", e)
+
     # Snapshot the registry under the lock, then release it before the
     # per-crew restart loop so the lock is not held across gateway waits
     # (up to 30s each).  Per-crew write-backs re-acquire the lock individually.
@@ -1819,15 +1870,34 @@ def _patch_crew_config(podman: PodmanClient, container: str, composition_entry: 
         "reasoning_effort": "max",
         "subagent_timeout_secs": GA_SUBAGENT_TIMEOUT_SECS,
         "subagent_max_turns": GA_SUBAGENT_MAX_TURNS,
-        # ``sandbox_allow_unsandboxed_exec=True`` is the correct rootless escape
-        # hatch introduced in KiroCrew 0.7.0. Podman rootless cannot perform
-        # user-namespace bind mounts (errno EPERM), so we must opt out of the
-        # inner namespace sandbox. In 0.7.0 the text-based credential gate was
-        # removed — bind masks are now the only fence — so the prior ``sandbox:
-        # "off"`` left no protection. ``sandbox_allow_unsandboxed_exec: true``
-        # is the explicit opt-in for hosts that cannot sandbox: it skips only
-        # the failing bind-mount step while keeping all other credential guards
-        # in place. The Podman container itself remains the OS-level boundary.
+        # KiroCrew 0.9.0 sandbox bypass for Podman rootless hosts.
+        #
+        # Podman rootless cannot perform user-namespace bind mounts inside the
+        # container (the kernel refuses ``unshare(CLONE_NEWNS)`` or the mount
+        # propagation step with errno EPERM/EACCES). Two complementary keys are
+        # needed:
+        #
+        # ``sandbox: "off"`` — skip the sandbox launcher entirely. wrap_argv()
+        #   returns the unmodified argv immediately when mode=="off", before
+        #   probing or launching the namespace setup. The governance floor clamp
+        #   runs first, but on a non-enterprise crew container (no IAM Identity
+        #   Center governance profile) the floor is absent and "off" passes
+        #   through. Equivalent to the old 0.6.x behaviour where ``sandbox: "off"``
+        #   was the sole escape hatch.
+        #
+        # ``sandbox_allow_unsandboxed_exec: true`` — belt-and-suspenders for
+        #   subsequent spawns when the ACP runtime re-reads config independently.
+        #   In 0.9.0 the gateway's entrypoint pre-checks config.json (not the
+        #   merged config.local.json) and emits a hint if the key is absent; the
+        #   key in config.local.json satisfies the actual gate via
+        #   KiroCrewConfig.load() deep-merge, but setting it alongside sandbox:off
+        #   makes the intent unambiguous.
+        #
+        # The Podman container itself (and the workspace volume isolation) remain
+        # the OS-level security boundary. This is equivalent to running KiroCrew
+        # on any other unsandboxable host (e.g. macOS without SIP or inside a
+        # Docker container with the default seccomp profile).
+        "sandbox": "off",
         "sandbox_allow_unsandboxed_exec": True,
     }
     # When GA_CREW_ACP_BACKEND=claude, write acp_backend into the crew config so
@@ -2071,7 +2141,7 @@ def _finish_crew_setup(
     if GA_CREW_ACP_BACKEND == "claude":
         # Task 3.4: warn at launch time that outbound access is required.
         # Use the override endpoint when set, otherwise api.anthropic.com.
-        _effective_endpoint = GA_CREW_ANTHROPIC_BASE_URL or "api.anthropic.com"
+        _effective_endpoint = ANTHROPIC_BASE_URL or "api.anthropic.com"
         logger.warning(
             "GA_CREW_ACP_BACKEND=claude: crew %s requires outbound access to "
             "%s to function",
@@ -2079,9 +2149,11 @@ def _finish_crew_setup(
             _effective_endpoint,
         )
         # Task 3.2: API key path (env var injected at container_create) takes
-        # precedence over OAuth path. If no API key, inject OAuth credentials
-        # from ga-claude-auth into the crew container's ~/.claude/ directory.
-        if not GA_CREW_ANTHROPIC_API_KEY and _claude_auth_exists():
+        # precedence over OAuth path, then CLAUDE_CODE_OAUTH_TOKEN (TRN-226).
+        # Only with neither set, inject OAuth credentials from ga-claude-auth
+        # into ~/.claude/, so a crew never holds two Claude credentials.
+        if (not ANTHROPIC_API_KEY and not CLAUDE_CODE_OAUTH_TOKEN
+                and _claude_auth_exists()):
             try:
                 _inject_claude_auth(podman, container)
             except Exception as e:
@@ -2090,7 +2162,7 @@ def _finish_crew_setup(
                     "unable to authenticate against api.anthropic.com",
                     crew_id, e,
                 )
-        # If GA_CREW_ANTHROPIC_API_KEY is set, the env var was already injected
+        # If ANTHROPIC_API_KEY is set, the env var was already injected
         # at container_create time (server.py launch()); nothing more to do here.
         # If neither API key nor ga-claude-auth is present, this path is
         # unreachable: launch() blocks before reaching _finish_crew_setup
@@ -2103,9 +2175,9 @@ def _finish_crew_setup(
         # approval-suppression env var is needed (see crew-governance).
         #
         # Task 3.5: warn at launch time that outbound access to the effective
-        # OpenAI endpoint is required. Use GA_CREW_OPENAI_BASE_URL when set,
+        # OpenAI endpoint is required. Use OPENAI_BASE_URL when set,
         # otherwise api.openai.com.
-        _effective_endpoint = GA_CREW_OPENAI_BASE_URL or "api.openai.com"
+        _effective_endpoint = OPENAI_BASE_URL or "api.openai.com"
         logger.warning(
             "GA_CREW_ACP_BACKEND=codex: crew %s requires outbound access to "
             "%s to function",
@@ -2116,7 +2188,7 @@ def _finish_crew_setup(
         # container_create) takes precedence over OAuth path. If no API key,
         # inject OAuth credentials from ga-codex-auth into the crew container's
         # ~/.codex/ directory (the path codex-acp reads).
-        if not GA_CREW_OPENAI_API_KEY and _codex_auth_exists():
+        if not OPENAI_API_KEY and _codex_auth_exists():
             try:
                 _inject_codex_auth(podman, container)
             except Exception as e:
@@ -2125,7 +2197,7 @@ def _finish_crew_setup(
                     "unable to authenticate against api.openai.com",
                     crew_id, e,
                 )
-        # If GA_CREW_OPENAI_API_KEY is set, the env var was already injected
+        # If OPENAI_API_KEY is set, the env var was already injected
         # at container_create time (server.py launch()); nothing more to do here.
         # If neither API key nor ga-codex-auth is present, this path is
         # unreachable: launch() blocks before reaching _finish_crew_setup
@@ -2257,15 +2329,14 @@ def _finish_crew_setup(
     # Fire-and-report: non-fatal. AcpProcessDied on the prewarm is acceptable —
     # it still expands the balloon. Errors are logged but never bubble up to the
     # caller so launch always succeeds even if prewarm fails.
-    if GA_PREWARM_ENABLED:
-        try:
-            pw = _prewarm_crew(crew_entry, crew_id)
-            if pw.get("pre_warm_task_id"):
-                result["pre_warm_task_id"] = pw["pre_warm_task_id"]
-            result["pre_warm_status"] = pw.get("status", "unknown")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Crew %s prewarm failed (non-fatal): %s", crew_id, exc)
-            result["pre_warm_status"] = "error"
+    try:
+        pw = _prewarm_crew(crew_entry, crew_id)
+        if pw.get("pre_warm_task_id"):
+            result["pre_warm_task_id"] = pw["pre_warm_task_id"]
+        result["pre_warm_status"] = pw.get("status", "unknown")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Crew %s prewarm failed (non-fatal): %s", crew_id, exc)
+        result["pre_warm_status"] = "error"
 
     return result
 
@@ -2350,7 +2421,7 @@ def _start_claude_login_container(podman: PodmanClient) -> str:
     except Exception as e:
         raise RuntimeError(
             f"Failed to create Claude login container from image {KC_IMAGE!r}: {e}. "
-            "Enable claude in GA_AGENT_BACKENDS and re-run `ghostship install`."
+            "Enable claude in GA_CREW_AGENT and re-run `ghostship install`."
         ) from e
     podman.container_start(name)
     logger.info("Started ephemeral Claude login container %s", name)
@@ -2528,6 +2599,7 @@ def _run_pty_login_flow(
     url_patterns: "list[re.Pattern]",
     code_pattern: "re.Pattern | None",
     deadline_secs: float = 45.0,
+    initial_bytes: bytes = b"",
 ) -> "tuple[str | None, str | None]":
     """Run a PTY select-loop and extract a login URL and optional code.
 
@@ -2556,49 +2628,71 @@ def _run_pty_login_flow(
         Pass ``None`` when the backend does not surface a code.
     deadline_secs:
         Wall-clock budget for the loop.  Default 45 s.
+    initial_bytes:
+        PTY bytes already received (leftover from the HTTP upgrade read in
+        ``container_exec_pty_stdin``).  Pre-populated into the accumulator so
+        no early output is lost before the select-loop starts.
     """
     deadline = time.time() + deadline_secs
-    collected = bytearray()
+    # Pre-seed the accumulator with any bytes already received during the
+    # HTTP-to-PTY upgrade handshake so they are not lost.
+    collected = bytearray(initial_bytes)
     login_url: str | None = None
     login_code: str | None = None
     answered: set[int] = set()  # indices into prompt_patterns already sent
 
-    try:
-        while time.time() < deadline:
-            ready, _, _ = select.select([pty_sock], [], [], 0.1)
-            if ready:
+    def _process_collected() -> bool:
+        """Process current contents of ``collected``; return True when a URL is found."""
+        nonlocal login_url, login_code
+        raw_text = collected.decode("utf-8", errors="replace")
+        text = _strip_terminal_sequences(raw_text)
+        url_ready = not _OPEN_SEQUENCE_RE.search(raw_text)
+
+        for idx, (pattern, answer) in enumerate(prompt_patterns):
+            if idx in answered:
+                continue
+            if pattern.search(text):
                 try:
-                    chunk = pty_sock.recv(4096)
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    break
-                collected.extend(chunk)
-                raw_text = collected.decode("utf-8", errors="replace")
-                text = _strip_terminal_sequences(raw_text)
-                url_ready = not _OPEN_SEQUENCE_RE.search(raw_text)
+                    pty_sock.sendall(answer)
+                except Exception:
+                    pass
+                answered.add(idx)
 
-                for idx, (pattern, answer) in enumerate(prompt_patterns):
-                    if idx in answered:
+        for pat in url_patterns if url_ready else ():
+            m = pat.search(text)
+            if m:
+                login_url = (m.group(1) if m.lastindex else m.group(0)).rstrip(").,")
+                if code_pattern:
+                    cm = code_pattern.search(login_url) or code_pattern.search(text)
+                    if cm:
+                        # Support two-branch patterns: group(1) is the URL-param
+                        # branch; group(2) is the prose branch.  Use whichever
+                        # branch matched (the other will be None).
+                        login_code = cm.group(1) or (
+                            cm.group(2) if cm.lastindex and cm.lastindex >= 2 else None
+                        )
+                return True
+        return False
+
+    try:
+        # If initial_bytes already contain the URL, return without entering the
+        # select loop.  This is the common case when PTY output arrives in the
+        # same recv() chunk as the 101 Switching Protocols headers.
+        if collected and _process_collected():
+            pass  # login_url is set; the ``if login_url`` branch below handles drain.
+        else:
+            while time.time() < deadline:
+                ready, _, _ = select.select([pty_sock], [], [], 0.1)
+                if ready:
+                    try:
+                        chunk = pty_sock.recv(4096)
+                    except BlockingIOError:
                         continue
-                    if pattern.search(text):
-                        try:
-                            pty_sock.sendall(answer)
-                        except Exception:
-                            pass
-                        answered.add(idx)
-
-                for pat in url_patterns if url_ready else ():
-                    m = pat.search(text)
-                    if m:
-                        login_url = (m.group(1) if m.lastindex else m.group(0)).rstrip(").,")
-                        if code_pattern:
-                            cm = code_pattern.search(login_url) or code_pattern.search(text)
-                            if cm:
-                                login_code = cm.group(1)
+                    if not chunk:
                         break
-                if login_url:
-                    break
+                    collected.extend(chunk)
+                    if _process_collected():
+                        break
     except Exception as e:
         logger.warning("PTY read error in _run_pty_login_flow: %s", e)
 
@@ -2716,7 +2810,7 @@ def _initiate_login(podman: "PodmanClient") -> dict:
         ["--license", KIRO_LICENSE] if KIRO_LICENSE else []
     )
     try:
-        exec_id, pty_sock = podman.container_exec_pty_stdin(container, cmd)
+        exec_id, pty_sock, leftover = podman.container_exec_pty_stdin(container, cmd)
     except Exception as e:
         _nuke_login_container(podman, container)
         with _login_pending_lock:
@@ -2756,6 +2850,7 @@ def _initiate_login(podman: "PodmanClient") -> dict:
         url_patterns=kiro_url_patterns,
         code_pattern=_kiro_code_re,
         deadline_secs=45.0,
+        initial_bytes=leftover,
     )
 
     if not login_url:
@@ -2777,6 +2872,38 @@ def _initiate_login(podman: "PodmanClient") -> dict:
     logger.info("Login flow started in %s, URL extracted", container)
     return {"login_url": login_url, "code": login_code}
 
+
+def _abort_pending_login(podman: "PodmanClient") -> bool:
+    """Abort an in-progress kiro login flow, if any.
+
+    Acquires _login_pending_lock, nukes the login container (best-effort), and
+    clears _login_pending so a fresh POST /login can be issued immediately.
+
+    Returns True if a flow was in progress and was aborted, False if there was
+    nothing to abort (no-op).
+
+    Safe to call from the logout handler regardless of whether a flow is
+    pending.
+    """
+    global _login_pending
+    with _login_pending_lock:
+        pending = _login_pending
+        if pending is None:
+            return False
+        # Clear state immediately under the lock so concurrent callers see no
+        # pending flow even if the container nuke takes a moment.
+        _login_pending = None
+
+    container = pending.get("container")
+    if container:
+        try:
+            _nuke_login_container(podman, container)
+            logger.info("Aborted pending kiro login in container %s", container)
+        except Exception as e:
+            logger.warning("Could not nuke login container %s: %s", container, e)
+    else:
+        logger.info("Aborted pending kiro login (container not yet started)")
+    return True
 
 
 # ── Claude OAuth device-flow state ────────────────────────────────────────────
@@ -2859,7 +2986,7 @@ def _initiate_claude_login(podman: "PodmanClient") -> dict:
         return {
             "error": (
                 f"'claude' CLI not found in image {KC_IMAGE!r}. "
-                "Enable claude in GA_AGENT_BACKENDS and re-run `ghostship install`."
+                "Enable claude in GA_CREW_AGENT and re-run `ghostship install`."
             )
         }
 
@@ -2874,7 +3001,7 @@ def _initiate_claude_login(podman: "PodmanClient") -> dict:
     # any https:// URL if no more specific match is found within 45 seconds.
     cmd = ["claude", "auth", "login"]
     try:
-        exec_id, pty_sock = podman.container_exec_pty_stdin(container, cmd)
+        exec_id, pty_sock, leftover = podman.container_exec_pty_stdin(container, cmd)
     except Exception as e:
         _nuke_claude_login_container(podman, container)
         with _claude_login_pending_lock:
@@ -2909,6 +3036,7 @@ def _initiate_claude_login(podman: "PodmanClient") -> dict:
         url_patterns=claude_url_patterns,
         code_pattern=None,
         deadline_secs=45.0,
+        initial_bytes=leftover,
     )
 
     if not login_url:
@@ -2943,6 +3071,12 @@ def _initiate_claude_login(podman: "PodmanClient") -> dict:
 # How long a submitted code may take to complete the exchange before the flow is
 # abandoned. The exchange is a single network round-trip, so this is generous.
 CLAUDE_LOGIN_CODE_DEADLINE_SECS = 120.0
+
+# TTLs for kiro and Codex device flows.  Matches CLAUDE_LOGIN_APPROVAL_DEADLINE_SECS —
+# same device-flow window.  An abandoned flow exceeding this limit is expired by
+# _sweep_expired_logins regardless of polling activity.
+KIRO_LOGIN_TTL_SECS = 900.0
+CODEX_LOGIN_TTL_SECS = 900.0
 
 
 def _submit_claude_login_code(code: str) -> dict:
@@ -2998,6 +3132,106 @@ def _claude_login_code_expired(pending: dict) -> bool:
         return submitted_at is not None and now - submitted_at > CLAUDE_LOGIN_CODE_DEADLINE_SECS
     return False
 
+
+def _kiro_login_expired(pending: dict) -> bool:
+    """True when a kiro device flow has exceeded KIRO_LOGIN_TTL_SECS."""
+    started_at = pending.get("started_at")
+    return started_at is not None and time.time() - started_at > KIRO_LOGIN_TTL_SECS
+
+
+def _codex_login_expired(pending: dict) -> bool:
+    """True when a Codex device flow has exceeded CODEX_LOGIN_TTL_SECS."""
+    started_at = pending.get("started_at")
+    return started_at is not None and time.time() - started_at > CODEX_LOGIN_TTL_SECS
+
+
+def _sweep_expired_logins(podman: "PodmanClient") -> None:
+    """Expire pending login flows that have exceeded their TTL.
+
+    Inspects the pending-login dicts for all three backends (kiro, Claude,
+    Codex) under their respective locks and expires any flow whose deadline has
+    passed.  On expiry: nukes the login container (best-effort) and clears the
+    pending dict so a fresh login can be started.
+
+    Must be called from a context that already holds the ``podman`` client (e.g.
+    the startup sweep in ``_reconcile_registry``).  The function is intentionally
+    coarse-grained: each backend's check acquires and releases its own lock
+    independently so a slow nuke does not hold an unrelated backend's lock.
+    """
+    global _login_pending, _claude_login_pending, _codex_login_pending
+
+    # ── kiro ──────────────────────────────────────────────────────────────────
+    with _login_pending_lock:
+        kiro_pending = _login_pending
+    if kiro_pending is not None and _kiro_login_expired(kiro_pending):
+        container = kiro_pending.get("container")
+        logger.warning(
+            "Expiring stale kiro login flow (started_at=%.0f, container=%s)",
+            kiro_pending.get("started_at", 0),
+            container,
+        )
+        if container:
+            try:
+                _nuke_login_container(podman, container)
+            except Exception as e:
+                logger.warning("Failed to nuke stale kiro login container %s: %s", container, e)
+        with _login_pending_lock:
+            # Re-check under lock to avoid a race with a concurrent poll completing.
+            if _login_pending is kiro_pending:
+                _login_pending = None
+
+    # ── Claude ────────────────────────────────────────────────────────────────
+    with _claude_login_pending_lock:
+        claude_pending = _claude_login_pending
+    if claude_pending is not None and _claude_login_code_expired(claude_pending):
+        container = claude_pending.get("container")
+        sock = claude_pending.get("pty_sock")
+        logger.warning(
+            "Expiring stale Claude login flow (state=%s, started_at=%.0f, container=%s)",
+            claude_pending.get("state"),
+            claude_pending.get("started_at", 0),
+            container,
+        )
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if container:
+            try:
+                _nuke_claude_login_container(podman, container)
+            except Exception as e:
+                logger.warning("Failed to nuke stale Claude login container %s: %s", container, e)
+        with _claude_login_pending_lock:
+            if _claude_login_pending is claude_pending:
+                _claude_login_pending = None
+        # Spec (claude-auth): on sweep expiry the transport SHALL record
+        # action=login outcome=failure in the audit log, mirroring the
+        # poll-driven expiry path in server.py.  No HTTP request here, so
+        # source is None.
+        _security.audit_auth_event(
+            action="login", outcome="failure", account="claude",
+            source=None, emit=logger.info,
+        )
+
+    # ── Codex ─────────────────────────────────────────────────────────────────
+    with _codex_login_pending_lock:
+        codex_pending = _codex_login_pending
+    if codex_pending is not None and _codex_login_expired(codex_pending):
+        container = codex_pending.get("container")
+        logger.warning(
+            "Expiring stale Codex login flow (started_at=%.0f, container=%s)",
+            codex_pending.get("started_at", 0),
+            container,
+        )
+        if container:
+            try:
+                _nuke_codex_login_container(podman, container)
+            except Exception as e:
+                logger.warning("Failed to nuke stale Codex login container %s: %s", container, e)
+        with _codex_login_pending_lock:
+            if _codex_login_pending is codex_pending:
+                _codex_login_pending = None
 
 
 CLAUDE_CREDENTIAL_FILE = ".credentials.json"
@@ -3071,6 +3305,42 @@ def _poll_claude_login_container(podman: "PodmanClient", container: str) -> byte
     return None
 
 
+def _abort_claude_pending_login(podman: "PodmanClient") -> bool:
+    """Abort an in-progress Claude login flow, if any.
+
+    Mirrors _abort_pending_login for the Claude OAuth device flow. Acquires
+    _claude_login_pending_lock, closes the PTY socket if present, nukes the
+    login container (best-effort), and clears _claude_login_pending.
+
+    Returns True if a flow was aborted, False if nothing was pending.
+    """
+    global _claude_login_pending
+    with _claude_login_pending_lock:
+        pending = _claude_login_pending
+        if pending is None:
+            return False
+        _claude_login_pending = None
+
+    # Close PTY socket if present (best-effort)
+    pty_sock = pending.get("pty_sock")
+    if pty_sock is not None:
+        try:
+            pty_sock.close()
+        except Exception:
+            pass
+
+    container = pending.get("container")
+    if container:
+        try:
+            _nuke_claude_login_container(podman, container)
+            logger.info("Aborted pending Claude login in container %s", container)
+        except Exception as e:
+            logger.warning("Could not nuke Claude login container %s: %s", container, e)
+    else:
+        logger.info("Aborted pending Claude login (container not yet started)")
+    return True
+
+
 # ── Codex login container helpers ─────────────────────────────────────────────
 
 
@@ -3079,7 +3349,7 @@ def _start_codex_login_container(podman: PodmanClient) -> str:
 
     Uses KC_IMAGE (the local spec-ops image built with the codex toolchain)
     because the ``codex-acp`` adapter is only present in that image. Fails with a
-    clear error naming GA_AGENT_BACKENDS if the image cannot start.
+    clear error naming GA_CREW_AGENT if the image cannot start.
     The actual adapter-binary check happens after start in _initiate_codex_login.
     Returns the container name.
     """
@@ -3100,7 +3370,7 @@ def _start_codex_login_container(podman: PodmanClient) -> str:
     except Exception as e:
         raise RuntimeError(
             f"Failed to create Codex login container from image {KC_IMAGE!r}: {e}. "
-            "Enable codex in GA_AGENT_BACKENDS and re-run `ghostship install`."
+            "Enable codex in GA_CREW_AGENT and re-run `ghostship install`."
         ) from e
     podman.container_start(name)
     logger.info("Started ephemeral Codex login container %s", name)
@@ -3276,14 +3546,14 @@ def _initiate_codex_login(podman: "PodmanClient") -> dict:
         return {
             "error": (
                 f"'codex-acp' adapter not found in image {KC_IMAGE!r}. "
-                "Enable codex in GA_AGENT_BACKENDS and re-run `ghostship install`."
+                "Enable codex in GA_CREW_AGENT and re-run `ghostship install`."
             )
         }
 
     # ── Phase: PTY exec ───────────────────────────────────────────────────────
     cmd = ["codex-acp", "login"]
     try:
-        exec_id, pty_sock = podman.container_exec_pty_stdin(container, cmd)
+        exec_id, pty_sock, leftover = podman.container_exec_pty_stdin(container, cmd)
     except Exception as e:
         _nuke_codex_login_container(podman, container)
         with _codex_login_pending_lock:
@@ -3311,7 +3581,11 @@ def _initiate_codex_login(podman: "PodmanClient") -> dict:
     # Combined pattern: prefer user_code= query param in the URL; fall back to a
     # "Code: XXXX" line in the output text.  The helper searches URL first, then
     # full accumulated text, preserving original priority.
-    codex_code_pattern = re.compile(r"(?:[?&]user_code=|[Cc]ode[:\s]+)([A-Za-z0-9_-]{4,})")
+    # The prose branch is restricted to uppercase-or-digit tokens of 4–8 chars
+    # with a word boundary to avoid matching prose words like "will" or "expire".
+    codex_code_pattern = re.compile(
+        r"(?:[?&]user_code=([A-Za-z0-9_-]{4,})|[Cc]ode[:\s]+([A-Z0-9]{4,8})\b)"
+    )
 
     login_url, login_code = _run_pty_login_flow(
         pty_sock=pty_sock,
@@ -3319,6 +3593,7 @@ def _initiate_codex_login(podman: "PodmanClient") -> dict:
         url_patterns=codex_url_patterns,
         code_pattern=codex_code_pattern,
         deadline_secs=45.0,
+        initial_bytes=leftover,
     )
 
     if not login_url:
@@ -3385,6 +3660,34 @@ def _poll_codex_login_container(podman: "PodmanClient", container: str) -> bytes
     except Exception as e:
         logger.warning("Error polling Codex login container: %s", e)
     return None
+
+
+def _abort_codex_pending_login(podman: "PodmanClient") -> bool:
+    """Abort an in-progress Codex login flow, if any.
+
+    Mirrors _abort_pending_login for the Codex OAuth device flow. Acquires
+    _codex_login_pending_lock, nukes the login container (best-effort), and
+    clears _codex_login_pending.
+
+    Returns True if a flow was aborted, False if nothing was pending.
+    """
+    global _codex_login_pending
+    with _codex_login_pending_lock:
+        pending = _codex_login_pending
+        if pending is None:
+            return False
+        _codex_login_pending = None
+
+    container = pending.get("container")
+    if container:
+        try:
+            _nuke_codex_login_container(podman, container)
+            logger.info("Aborted pending Codex login in container %s", container)
+        except Exception as e:
+            logger.warning("Could not nuke Codex login container %s: %s", container, e)
+    else:
+        logger.info("Aborted pending Codex login (container not yet started)")
+    return True
 
 
 # ── Schedule / idle monitors ───────────────────────────────────────

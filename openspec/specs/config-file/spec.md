@@ -63,6 +63,21 @@ The documentation SHALL also document the full model precedence chain:
 
 Variables removed from the operator-configurable surface (`HOST`, `GA_PORTAL_ADMIN_URL`, `GA_FILE_TTL_SECS`, `GA_PICKUP_MAX_POLL_SECS`, `GA_MEMORY_WAIT_SECS`, `KC_GATEWAY_TOKEN_TTL`, `GA_ENFORCE_HTTPS_REDIRECT`, `GA_CSP_ENFORCE`) SHALL NOT appear in the supported variable list. `GA_PORTAL_PORT` SHALL appear only as a deprecated alias with a note pointing to `PORT`.
 
+The documentation SHALL include a "Knowledge auto-ingest" note stating that:
+- ghostship does not enable knowledge auto-ingest;
+- under KiroCrew 0.9.0+ (PR #2448) knowledge auto-ingest (artifact watcher, agent
+  auto-add-documents path, folder ingestion) is opt-in rather than default-on;
+- the disabled posture relies on the verified upstream default and is NOT pinned in the
+  crew config, because verification against the pinned base image (`kiro_crew` 0.9.0rc4,
+  `ghcr.io/kirodotdev/kirocrew:0.9.0-insider.4`) found no single `knowledge.auto_ingest`
+  boolean to pin — the real toggles (`knowledge.auto_ingest_artifacts`,
+  `knowledge.auto_add_documents`) each already default to `false`;
+- the open item (a future upstream default flip could silently enable ingest) is guarded by
+  a CI regression test (`tests/unit/test_trn223_knowledge_autoingest.py`) rather than a
+  config pin;
+- an operator who wants knowledge built from commits in the mounted worktree must opt in
+  explicitly.
+
 #### Scenario: Config file section present in docs
 - **WHEN** reading `docs/configuration.md`
 - **THEN** it SHALL contain a "Config file" section explaining that the file is a shell script exporting variables, listing all supported variable names, and stating the resolution order: built-in default → config file → command-line flag
@@ -78,6 +93,12 @@ Variables removed from the operator-configurable surface (`HOST`, `GA_PORTAL_ADM
 #### Scenario: Removed vars absent from docs
 - **WHEN** reading `docs/configuration.md`
 - **THEN** the removed variables SHALL NOT appear as supported operator-configurable inputs
+
+#### Scenario: Knowledge auto-ingest posture documented
+- **WHEN** an operator reads the knowledge section of `docs/configuration.md`
+- **THEN** they learn that auto-ingest is off by the verified upstream default, that it is
+  deliberately NOT pinned (no `knowledge.auto_ingest` key exists to pin), that a CI test
+  guards against an upstream default flip, and how to opt in explicitly if wanted
 
 ### Requirement: Auth docs config file reference
 `docs/auth.md` SHALL document the config file as the first item in identity provider resolution order (config file → flags → interactive prompt) and include an example config file snippet for identity provider settings.
@@ -98,7 +119,10 @@ The transport SHALL load all runtime configuration from environment variables ex
 - **THEN** the `Config` dataclass applies the same default that was previously scattered at each call site
 
 ### Requirement: Config fields match ghostship.conf.example
+
 Every field in the `Config` dataclass SHALL have a corresponding commented-out entry in `config/ghostship.conf.example`, and vice versa. A CI test SHALL assert this invariant so the two cannot silently diverge.
+
+`config/ghostship.conf.example` SHALL include a `GA_RATE_LIMIT_DASHBOARD_AUTH` entry (default `600:60`) in the HTTP rate limiting section.
 
 #### Scenario: CI sync check passes
 - **WHEN** `Config` fields and `ghostship.conf.example` entries are in sync
@@ -107,6 +131,10 @@ Every field in the `Config` dataclass SHALL have a corresponding commented-out e
 #### Scenario: CI sync check fails on drift
 - **WHEN** a field is added to `Config` without a matching entry in `ghostship.conf.example`
 - **THEN** the CI test fails and identifies the missing entry
+
+#### Scenario: GA_RATE_LIMIT_DASHBOARD_AUTH in example config
+- **WHEN** an operator opens `config/ghostship.conf.example` to configure rate limits
+- **THEN** they find a commented `GA_RATE_LIMIT_DASHBOARD_AUTH=600:60` entry alongside the other `GA_RATE_LIMIT_*` vars with a description of the `/dashboard/auth` endpoint
 
 ### Requirement: Operator-configurable git author identity for crew commits
 The system SHALL optionally inject `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL` environment variables into crew containers at creation time when `GA_GIT_AUTHOR_NAME` and `GA_GIT_AUTHOR_EMAIL` are set. When set, all commits made by agents inside the crew SHALL carry the operator's configured identity as both author and committer.
@@ -118,3 +146,33 @@ The system SHALL optionally inject `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_C
 #### Scenario: Identity not injected when unconfigured
 - **WHEN** `GA_GIT_AUTHOR_NAME` is unset
 - **THEN** the crew container does not have `GIT_AUTHOR_NAME` or `GIT_COMMITTER_NAME` in its environment — kiro-cli uses its own per-session identity
+
+### Requirement: Configuration docs accurately describe GA_FILE_SECRET and TRANSPORT_DATA_DIR behaviour
+
+`docs/configuration.md` SHALL document in the `GA_FILE_SECRET` table row that the absence from `compose.yml` is intentional: the secret is auto-generated and persisted in `DATA_DIR/ga-file-secret` on first start; no operator override is needed or supported.
+
+`docs/configuration.md` SHALL document in the `TRANSPORT_DATA_DIR` table row that this variable is effectively pinned to `/data` in the standard install because `DATA_DIR` is always mounted as `/data`; changing it would require a custom compose override.
+
+#### Scenario: Operator reads GA_FILE_SECRET docs
+- **WHEN** an operator reads the `GA_FILE_SECRET` entry in `docs/configuration.md`
+- **THEN** they understand that the value is auto-generated by the transport on first start, not passed through compose, and no override is needed
+
+#### Scenario: Operator reads TRANSPORT_DATA_DIR docs
+- **WHEN** an operator reads the `TRANSPORT_DATA_DIR` entry in `docs/configuration.md`
+- **THEN** they understand that the effective value is `/data` in the standard install and cannot be changed without a custom compose override
+
+### Requirement: GA_MAX_ACTIVE_CREWS documents zero-and-negative-disable semantics
+
+`docs/configuration.md` and `config/ghostship.conf.example` SHALL document that any value ≤ 0 for `GA_MAX_ACTIVE_CREWS` disables the active-crew limit (not only `0`).
+
+#### Scenario: Operator reads GA_MAX_ACTIVE_CREWS docs
+- **WHEN** an operator reads the `GA_MAX_ACTIVE_CREWS` entry in `docs/configuration.md`
+- **THEN** they see "Set to 0 (or any value ≤ 0) to disable the active-crew limit"
+
+### Requirement: _TASK_TIMESTAMP_TTL_SECS comment is accurate
+
+The comment block above `_TASK_TIMESTAMP_TTL_SECS` in `transport/lifecycle.py` SHALL accurately describe the floor behaviour: `_warm_marker_ttl_secs()` enforces a one-hour floor; `_TASK_TIMESTAMP_TTL_SECS` does not. The comment SHALL NOT claim a floor that does not exist.
+
+#### Scenario: Code comment matches actual behaviour
+- **WHEN** a developer reads the `_TASK_TIMESTAMP_TTL_SECS` comment in `lifecycle.py`
+- **THEN** the comment accurately states which TTL has a floor and which does not, matching the actual code behaviour

@@ -1513,6 +1513,137 @@ class CaptainCookieInjectionTests(unittest.TestCase):
 
         self.assertEqual(task_id, "new-task-2")
 
+    def test_steer_captain_checkin_400_on_continue_falls_back_to_dispatch(self) -> None:
+        """TRN-230: 400 Bad Request on /continue (session gone after Raven completes)
+        must fall back to _dispatch_captain_checkin and clear current_task_id."""
+        import httpx2 as httpx
+        crew = {"container": "gs-demo", "cookie": "abc"}
+        captain_entry = {
+            "type": "captain",
+            "current_task_id": "finished-raven-task",
+            "model": None,
+        }
+        saved_regs: list[dict] = []
+        reg_data = {
+            "crews": {"demo": {"cookie": "abc", "container": "gs-demo"}},
+            "schedules": {"demo": [captain_entry]},
+        }
+
+        # Simulate _crew_api_with_recovery re-raising a raw 400 HTTPStatusError
+        # (which now happens after TRN-230 fix 1.1 — no longer wrapped in CrewUnresponsiveError)
+        mock_resp = Mock()
+        mock_resp.status_code = 400
+        http_err = httpx.HTTPStatusError(
+            "Client error '400 Bad Request' for url 'http://gs-demo:5476/api/spawn/finished-raven-task/continue'",
+            request=Mock(),
+            response=mock_resp,
+        )
+
+        dispatched: list[str] = []
+
+        def fake_dispatch(crew, crew_id, **kw):
+            dispatched.append(crew_id)
+            return "fresh-raven-task"
+
+        with (
+            patch.object(server, "_get_podman", return_value=Mock()),
+            patch.object(server, "_write_dashboard_cookie", return_value=True),
+            patch.object(server, "_load_registry", return_value=reg_data),
+            patch.object(server, "_registry_lock", threading.Lock()),
+            patch.object(server, "_get_crew_schedules", return_value=[captain_entry]),
+            patch.object(server, "_save_registry", side_effect=lambda r: saved_regs.append(dict(r))),
+            patch.object(server, "_crew_api_with_recovery", side_effect=http_err),
+            patch.object(server, "_dispatch_captain_checkin", side_effect=fake_dispatch),
+        ):
+            task_id = server._steer_captain_checkin(crew, "demo")
+
+        # Should have fallen back to dispatch
+        self.assertEqual(task_id, "fresh-raven-task")
+        self.assertEqual(dispatched, ["demo"])
+        # current_task_id should be cleared in registry
+        self.assertTrue(any(
+            s.get("current_task_id") is None
+            for s in saved_regs[-1].get("schedules", {}).get("demo", [])
+            if s.get("type") == "captain"
+        ), "current_task_id should be cleared after 400 fallback")
+
+    def test_steer_captain_checkin_400_on_non_continue_propagates(self) -> None:
+        """TRN-230: 400 Bad Request on a non-/continue path (e.g. spawn) should
+        propagate — the /continue guard must not swallow unrelated 400s."""
+        import httpx2 as httpx
+        crew = {"container": "gs-demo", "cookie": "abc"}
+        captain_entry = {
+            "type": "captain",
+            "current_task_id": "active-task",
+            "model": None,
+        }
+        reg_data = {
+            "crews": {"demo": {"cookie": "abc", "container": "gs-demo"}},
+            "schedules": {"demo": [captain_entry]},
+        }
+
+        mock_resp = Mock()
+        mock_resp.status_code = 400
+        http_err = httpx.HTTPStatusError(
+            "Client error '400 Bad Request' for url 'http://gs-demo:5476/api/spawn'",
+            request=Mock(),
+            response=mock_resp,
+        )
+
+        with (
+            patch.object(server, "_get_podman", return_value=Mock()),
+            patch.object(server, "_write_dashboard_cookie", return_value=True),
+            patch.object(server, "_load_registry", return_value=reg_data),
+            patch.object(server, "_registry_lock", threading.Lock()),
+            patch.object(server, "_get_crew_schedules", return_value=[captain_entry]),
+            patch.object(server, "_crew_api_with_recovery", side_effect=http_err),
+        ):
+            with self.assertRaises(httpx.HTTPStatusError):
+                server._steer_captain_checkin(crew, "demo")
+
+    def test_steer_captain_checkin_404_still_falls_back(self) -> None:
+        """TRN-230: existing 404/conversation_gone path still works after change."""
+        import httpx2 as httpx
+        crew = {"container": "gs-demo", "cookie": "abc"}
+        captain_entry = {
+            "type": "captain",
+            "current_task_id": "old-task",
+            "model": None,
+        }
+        reg_data = {
+            "crews": {"demo": {"cookie": "abc", "container": "gs-demo"}},
+            "schedules": {"demo": [captain_entry]},
+        }
+
+        mock_resp = Mock()
+        mock_resp.status_code = 404
+        http_err = httpx.HTTPStatusError(
+            "Client error '404 Not Found' for url 'http://gs-demo:5476/api/spawn/old-task/continue'",
+            request=Mock(),
+            response=mock_resp,
+        )
+
+        dispatched: list[str] = []
+
+        def fake_dispatch(crew, crew_id, **kw):
+            dispatched.append(crew_id)
+            return "new-task"
+
+        with (
+            patch.object(server, "_get_podman", return_value=Mock()),
+            patch.object(server, "_write_dashboard_cookie", return_value=True),
+            patch.object(server, "_load_registry", return_value=reg_data),
+            patch.object(server, "_registry_lock", threading.Lock()),
+            patch.object(server, "_get_crew_schedules", return_value=[captain_entry]),
+            patch.object(server, "_save_registry"),
+            patch.object(server, "_crew_api_with_recovery", side_effect=http_err),
+            patch.object(server, "_dispatch_captain_checkin", side_effect=fake_dispatch),
+        ):
+            task_id = server._steer_captain_checkin(crew, "demo")
+
+        self.assertEqual(task_id, "new-task")
+        self.assertEqual(dispatched, ["demo"])
+
 
 class CaptainClaudeModelDefaultingTests(unittest.TestCase):
     """TRN-210 task 2: _dispatch_captain_checkin defaults the dispatch model to
@@ -1673,3 +1804,153 @@ class RavenPersonaAuthDivergenceTests(unittest.TestCase):
         verbatim in the persona prompt, so the two cannot drift (design D1)."""
         prompt = self._raven_prompt()
         self.assertIn(captain_mod._RAVEN_GATEWAY_ORIENTATION, prompt)
+
+
+class _StopRequest:
+    """Minimal Request stub for _handle_captain_stop_post.
+
+    Provides the two attributes the handler touches: ``scope`` (for the path)
+    and ``cookies`` (for the mc_token_5476 dashboard cookie).
+    """
+
+    def __init__(self, crew_id: str = "demo", cookie: str | None = "good-cookie") -> None:
+        self.scope = {
+            "type": "http",
+            "method": "POST",
+            "path": f"/crews/{crew_id}/captain/stop",
+        }
+        self.cookies = {} if cookie is None else {"mc_token_5476": cookie}
+
+
+class CaptainStopEndpointTests(unittest.TestCase):
+    """Tests for the crew-internal POST /crews/{id}/captain/stop endpoint (TRN-232)."""
+
+    CREW = {"container": "gs-demo", "cookie": "cookie"}
+
+    def _reg(self, *, enabled: bool, cookie: str = "good-cookie") -> dict:
+        return {"crews": {"demo": {
+            "container": "gs-demo",
+            "cookie": "cookie",
+            "internal_cookie": cookie,
+            "schedules": [{
+                "type": "captain",
+                "name": "captain",
+                "enabled": enabled,
+                "current_task_id": "task-1",
+            }],
+        }}}
+
+    def test_success_disables_schedule_and_returns_200(self) -> None:
+        import asyncio
+
+        reg = self._reg(enabled=True)
+        podman = Mock()
+        podman.container_is_running.return_value = False
+        with (
+            patch.object(server, "_require_crew", return_value=self.CREW),
+            patch.object(server, "_load_registry", return_value=reg),
+            patch.object(server, "_save_registry"),
+            patch.object(server, "_get_podman", return_value=podman),
+            patch.object(server, "_captain_do_stop",
+                         wraps=server._captain_do_stop) as do_stop,
+            patch.object(captain_mod, "_mail_count", return_value=0),
+        ):
+            response = asyncio.run(
+                server._handle_captain_stop_post(_StopRequest())
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"status": "stopped"})
+        do_stop.assert_called_once_with("demo")
+        # Registry entry flipped to disabled.
+        self.assertFalse(reg["crews"]["demo"]["schedules"][0]["enabled"])
+
+    def test_already_stopped_returns_400(self) -> None:
+        import asyncio
+
+        reg = self._reg(enabled=False)
+        with (
+            patch.object(server, "_require_crew", return_value=self.CREW),
+            patch.object(server, "_load_registry", return_value=reg),
+            patch.object(server, "_captain_do_stop") as do_stop,
+        ):
+            response = asyncio.run(
+                server._handle_captain_stop_post(_StopRequest())
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body), {"error": "captain already stopped"}
+        )
+        do_stop.assert_not_called()
+
+    def test_no_captain_entry_returns_404(self) -> None:
+        import asyncio
+
+        reg = {"crews": {"demo": {
+            "container": "gs-demo",
+            "cookie": "cookie",
+            "internal_cookie": "good-cookie",
+            "schedules": [],
+        }}}
+        with (
+            patch.object(server, "_require_crew", return_value=self.CREW),
+            patch.object(server, "_load_registry", return_value=reg),
+            patch.object(server, "_captain_do_stop") as do_stop,
+        ):
+            response = asyncio.run(
+                server._handle_captain_stop_post(_StopRequest())
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            json.loads(response.body), {"error": "no captain entry for crew demo"}
+        )
+        do_stop.assert_not_called()
+
+    def test_unknown_crew_returns_404(self) -> None:
+        import asyncio
+
+        with (
+            patch.object(server, "_require_crew", side_effect=ValueError("no such crew")),
+        ):
+            response = asyncio.run(
+                server._handle_captain_stop_post(_StopRequest())
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            json.loads(response.body), {"error": "no captain entry for crew demo"}
+        )
+
+    def test_missing_cookie_returns_403(self) -> None:
+        import asyncio
+
+        reg = self._reg(enabled=True)
+        with (
+            patch.object(server, "_require_crew", return_value=self.CREW),
+            patch.object(server, "_load_registry", return_value=reg),
+            patch.object(server, "_captain_do_stop") as do_stop,
+        ):
+            response = asyncio.run(
+                server._handle_captain_stop_post(_StopRequest(cookie=None))
+            )
+
+        self.assertEqual(response.status_code, 403)
+        do_stop.assert_not_called()
+
+    def test_wrong_cookie_returns_403(self) -> None:
+        import asyncio
+
+        reg = self._reg(enabled=True, cookie="expected-cookie")
+        with (
+            patch.object(server, "_require_crew", return_value=self.CREW),
+            patch.object(server, "_load_registry", return_value=reg),
+            patch.object(server, "_captain_do_stop") as do_stop,
+        ):
+            response = asyncio.run(
+                server._handle_captain_stop_post(_StopRequest(cookie="wrong-cookie"))
+            )
+
+        self.assertEqual(response.status_code, 403)
+        do_stop.assert_not_called()

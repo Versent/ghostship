@@ -6,7 +6,7 @@ Covers:
 - 7.2 _patch_crew_config writes acp_backend: "codex" when the Codex backend is
       selected.
 - 7.3 kiro auth injection is skipped and OPENAI_API_KEY is injected when
-      GA_CREW_ACP_BACKEND=codex with GA_CREW_OPENAI_API_KEY set.
+      GA_CREW_ACP_BACKEND=codex with OPENAI_API_KEY set.
 - 7.4 With no API key, ga-codex-auth present → OAuth archive injected into
       ~/.codex/; neither present → launch() returns not_authenticated + login_url.
 - 7.5 OPENAI_BASE_URL is injected only for codex crews when set, not for
@@ -42,26 +42,26 @@ class TestCodexBackendConfigValidation(unittest.TestCase):
     """GA_CREW_ACP_BACKEND=codex accepted; unknown value errors; codex lazy."""
 
     def test_codex_backend_is_valid(self) -> None:
-        with patch.dict("os.environ", {"GA_CREW_ACP_BACKEND": "codex", "GA_AGENT_BACKENDS": "codex"}):
+        with patch.dict("os.environ", {"GA_CREW_AGENT": "codex"}):
             cfg = Config.from_env()
         self.assertEqual(cfg.ga_crew_acp_backend, "codex")
 
     def test_codex_backend_valid_with_api_key(self) -> None:
         env = {
-            "GA_CREW_ACP_BACKEND": "codex", "GA_AGENT_BACKENDS": "codex",
-            "GA_CREW_OPENAI_API_KEY": "sk-openai-test123",
+            "GA_CREW_AGENT": "codex",
+            "OPENAI_API_KEY": "sk-openai-test123",
         }
         with patch.dict("os.environ", env):
             cfg = Config.from_env()
         self.assertEqual(cfg.ga_crew_acp_backend, "codex")
-        self.assertEqual(cfg.ga_crew_openai_api_key, "sk-openai-test123")
+        self.assertEqual(cfg.openai_api_key, "sk-openai-test123")
 
     def test_unknown_value_still_errors_at_startup(self) -> None:
         """An unrecognised backend value still raises ConfigError at from_env()."""
-        with patch.dict("os.environ", {"GA_CREW_ACP_BACKEND": "gemini"}):
+        with patch.dict("os.environ", {"GA_CREW_AGENT": "gemini"}):
             with self.assertRaises(ConfigError) as ctx:
                 Config.from_env()
-        self.assertIn("GA_CREW_ACP_BACKEND", str(ctx.exception))
+        self.assertIn("GA_CREW_AGENT", str(ctx.exception))
         self.assertIn("gemini", str(ctx.exception))
 
     def test_codex_without_credential_does_not_error_at_startup(self) -> None:
@@ -70,17 +70,17 @@ class TestCodexBackendConfigValidation(unittest.TestCase):
         Credential enforcement is lazy (launch-time), matching the TRN-170 model.
         """
         env = {
-            "GA_CREW_ACP_BACKEND": "codex", "GA_AGENT_BACKENDS": "codex",
-            "GA_CREW_OPENAI_API_KEY": "",
+            "GA_CREW_AGENT": "codex",
+            "OPENAI_API_KEY": "",
         }
         with patch.dict("os.environ", env):
             cfg = Config.from_env()
         cfg.validate()  # must not raise
 
     def test_openai_base_url_stripped(self) -> None:
-        with patch.dict("os.environ", {"GA_CREW_OPENAI_BASE_URL": "  https://proxy.local/v1  "}):
+        with patch.dict("os.environ", {"OPENAI_BASE_URL": "  https://proxy.local/v1  "}):
             cfg = Config.from_env()
-        self.assertEqual(cfg.ga_crew_openai_base_url, "https://proxy.local/v1")
+        self.assertEqual(cfg.openai_base_url, "https://proxy.local/v1")
 
     def test_retired_include_codex_flag_rejected(self) -> None:
         """TRN-202: GA_INCLUDE_CODEX_AGENT is retired in favour of GA_AGENT_BACKENDS."""
@@ -88,7 +88,7 @@ class TestCodexBackendConfigValidation(unittest.TestCase):
             with self.assertRaises(ConfigError) as ctx:
                 Config.from_env()
         self.assertIn("GA_INCLUDE_CODEX_AGENT", str(ctx.exception))
-        self.assertIn("GA_AGENT_BACKENDS", str(ctx.exception))
+        self.assertIn("GA_CREW_AGENT", str(ctx.exception))
 
 
 # ── 7.2 _patch_crew_config writes acp_backend: "codex" ────────────────────────
@@ -170,7 +170,7 @@ class TestFinishCrewSetupCodexBranch(unittest.TestCase):
         podman = self._make_podman()
         with (
             patch.object(_lifecycle, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_API_KEY", "sk-openai-key"),
+            patch.object(_lifecycle, "OPENAI_API_KEY", "sk-openai-key"),
             patch.object(_lifecycle, "_inject_auth") as mock_inject_auth,
             patch.object(_lifecycle, "_inject_codex_auth"),
             patch.object(_lifecycle, "KIRO_API_KEY", ""),
@@ -180,11 +180,11 @@ class TestFinishCrewSetupCodexBranch(unittest.TestCase):
         self.assertEqual(result.get("status"), "ready")
 
     def test_api_key_path_does_not_inject_codex_auth(self) -> None:
-        """When GA_CREW_OPENAI_API_KEY is set, _inject_codex_auth is NOT called."""
+        """When OPENAI_API_KEY is set, _inject_codex_auth is NOT called."""
         podman = self._make_podman()
         with (
             patch.object(_lifecycle, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_API_KEY", "sk-openai-key"),
+            patch.object(_lifecycle, "OPENAI_API_KEY", "sk-openai-key"),
             patch.object(_lifecycle, "_inject_codex_auth") as mock_inject,
             patch.object(_lifecycle, "_inject_auth"),
             patch.object(_lifecycle, "KIRO_API_KEY", ""),
@@ -198,7 +198,7 @@ class TestFinishCrewSetupCodexBranch(unittest.TestCase):
         podman = self._make_podman()
         with (
             patch.object(_lifecycle, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_API_KEY", ""),
+            patch.object(_lifecycle, "OPENAI_API_KEY", ""),
             patch.object(_lifecycle, "_codex_auth_exists", return_value=True),
             patch.object(_lifecycle, "_inject_codex_auth") as mock_inject,
             patch.object(_lifecycle, "_inject_auth"),
@@ -213,8 +213,8 @@ class TestFinishCrewSetupCodexBranch(unittest.TestCase):
         podman = self._make_podman()
         with (
             patch.object(_lifecycle, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_API_KEY", "sk-openai-key"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_BASE_URL", ""),
+            patch.object(_lifecycle, "OPENAI_API_KEY", "sk-openai-key"),
+            patch.object(_lifecycle, "OPENAI_BASE_URL", ""),
             patch.object(_lifecycle, "_inject_auth"),
             patch.object(_lifecycle, "KIRO_API_KEY", ""),
         ):
@@ -226,12 +226,12 @@ class TestFinishCrewSetupCodexBranch(unittest.TestCase):
         )
 
     def test_codex_path_emits_warning_override_endpoint(self) -> None:
-        """WARNING names the configured GA_CREW_OPENAI_BASE_URL when set (7.5)."""
+        """WARNING names the configured OPENAI_BASE_URL when set (7.5)."""
         podman = self._make_podman()
         with (
             patch.object(_lifecycle, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_API_KEY", "sk-openai-key"),
-            patch.object(_lifecycle, "GA_CREW_OPENAI_BASE_URL", "https://proxy.local/v1"),
+            patch.object(_lifecycle, "OPENAI_API_KEY", "sk-openai-key"),
+            patch.object(_lifecycle, "OPENAI_BASE_URL", "https://proxy.local/v1"),
             patch.object(_lifecycle, "_inject_auth"),
             patch.object(_lifecycle, "KIRO_API_KEY", ""),
         ):
@@ -271,12 +271,12 @@ class TestLaunchCodexEnvInjection(unittest.TestCase):
 
         with (
             patch.object(server, "GA_CREW_ACP_BACKEND", backend),
-            patch.object(server, "_GA_CREW_OPENAI_API_KEY", api_key),
-            patch.object(server, "_GA_CREW_OPENAI_BASE_URL", base_url),
-            patch.object(server, "_GA_CREW_ANTHROPIC_API_KEY", anthropic_key),
-            patch.object(server, "_GA_CREW_ANTHROPIC_BASE_URL", anthropic_base),
+            patch.object(server, "_OPENAI_API_KEY", api_key),
+            patch.object(server, "_OPENAI_BASE_URL", base_url),
+            patch.object(server, "_ANTHROPIC_API_KEY", anthropic_key),
+            patch.object(server, "_ANTHROPIC_BASE_URL", anthropic_base),
             # Backends are opt-in via GA_AGENT_BACKENDS; enable all so each case reaches launch.
-            patch.object(server.cfg, "ga_agent_backends", frozenset({"kiro", "claude", "codex"})),
+            patch.object(server.cfg, "ga_crew_agent", "kiro,claude,codex"),
             patch.object(server, "KIRO_API_KEY", ""),
             patch.object(server, "_codex_auth_exists", return_value=True),
             patch.object(server, "_claude_auth_exists", return_value=True),
@@ -328,7 +328,7 @@ class TestLaunchCodexBackendNoCredentials(unittest.TestCase):
 
     def setUp(self) -> None:
         # Codex is opt-in via GA_AGENT_BACKENDS: enable it for these tests.
-        patcher = patch.object(server.cfg, "ga_agent_backends", frozenset({"kiro", "codex"}))
+        patcher = patch.object(server.cfg, "ga_crew_agent", "kiro,codex")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -339,7 +339,7 @@ class TestLaunchCodexBackendNoCredentials(unittest.TestCase):
         podman = Mock()
         with (
             patch.object(server, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(server, "_GA_CREW_OPENAI_API_KEY", ""),
+            patch.object(server, "_OPENAI_API_KEY", ""),
             patch.object(server, "_codex_auth_exists", return_value=False),
             patch.object(server, "_get_podman", return_value=podman),
             patch.object(
@@ -356,7 +356,7 @@ class TestLaunchCodexBackendNoCredentials(unittest.TestCase):
         podman = Mock()
         with (
             patch.object(server, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(server, "_GA_CREW_OPENAI_API_KEY", ""),
+            patch.object(server, "_OPENAI_API_KEY", ""),
             patch.object(server, "_codex_auth_exists", return_value=False),
             patch.object(server, "_get_podman", return_value=podman),
             patch.object(server, "_initiate_codex_login", return_value={"login_pending": True}),
@@ -369,7 +369,7 @@ class TestLaunchCodexBackendNoCredentials(unittest.TestCase):
         podman = Mock()
         with (
             patch.object(server, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(server, "_GA_CREW_OPENAI_API_KEY", "sk-openai-real"),
+            patch.object(server, "_OPENAI_API_KEY", "sk-openai-real"),
             patch.object(server, "_codex_auth_exists", return_value=False),
             patch.object(server, "_get_podman", return_value=podman),
             patch.object(server, "_initiate_codex_login") as mock_initiate,
@@ -386,7 +386,7 @@ class TestLaunchCodexBackendNoCredentials(unittest.TestCase):
         podman = Mock()
         with (
             patch.object(server, "GA_CREW_ACP_BACKEND", "codex"),
-            patch.object(server, "_GA_CREW_OPENAI_API_KEY", ""),
+            patch.object(server, "_OPENAI_API_KEY", ""),
             patch.object(server, "_codex_auth_exists", return_value=True),
             patch.object(server, "_get_podman", return_value=podman),
             patch.object(server, "_initiate_codex_login") as mock_initiate,
@@ -442,7 +442,7 @@ class TestHandleCodexLoginPost(unittest.TestCase):
         with _lifecycle._codex_login_pending_lock:
             _lifecycle._codex_login_pending = None
         # Codex is opt-in via GA_AGENT_BACKENDS: enable it for these tests.
-        patcher = patch.object(server.cfg, "ga_agent_backends", frozenset({"kiro", "codex"}))
+        patcher = patch.object(server.cfg, "ga_crew_agent", "kiro,codex")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -492,10 +492,10 @@ class TestHandleCodexLoginPost(unittest.TestCase):
 
     def test_returns_400_when_not_codex_backend(self) -> None:
         """TRN-202: refused when codex is not enabled, not when it merely isn't the default."""
-        with patch.object(server.cfg, "ga_agent_backends", frozenset({"kiro"})):
+        with patch.object(server.cfg, "ga_crew_agent", "kiro"):
             response = self._run()
         self.assertEqual(response.status_code, 400)
-        self.assertIn("GA_AGENT_BACKENDS", response.body.decode())
+        self.assertIn("GA_CREW_AGENT", response.body.decode())
 
     def test_returns_500_on_initiate_error(self) -> None:
         with (

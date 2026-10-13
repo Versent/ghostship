@@ -58,6 +58,7 @@ import posixpath
 import select
 import socket
 import tarfile
+import dataclasses
 import json
 import logging
 import os
@@ -358,7 +359,7 @@ HOST = cfg.host  # Binds all interfaces inside the container.
 # non-containerised installs where you want loopback-only binding.
 PORT = cfg.port
 
-DATA_DIR = Path(cfg.transport_data_dir)
+DATA_DIR = Path("/data")
 # REGISTRY_PATH is imported from transport.registry
 
 
@@ -419,18 +420,22 @@ def _validate_model(model: str | None) -> str | None:
         )
     return model
 GA_IDLE_TIMEOUT_SECS = cfg.ga_idle_timeout_secs
-# KiroCrew 0.4.0 requires a non-empty `agent` field in config.local.json; crew
-# creation fails at the gateway with a 4xx if it is absent. Default "kiro" is
-# KiroCrew's built-in agent name; operators override for a differently-named agent.
-GA_CREW_AGENT = cfg.ga_crew_agent
+# KiroCrew agent name written to config.local.json inside each crew.
+# Hardcoded: not operator-configurable (always the built-in KiroCrew agent name).
+_KC_AGENT_NAME = "kiro"
+# Retained as GA_CREW_AGENT for existing call sites.
+GA_CREW_AGENT = _KC_AGENT_NAME
 KC_MODEL_OVERRIDE = cfg.kc_model_override
 KC_MODEL_DEFAULT = cfg.kc_model_default
 GA_MIN_FREE_MEM_GB = cfg.ga_min_free_mem_gb
 GA_SPAWN_MIN_MEMORY_GB = cfg.ga_spawn_min_memory_gb
 GA_RESOURCE_PRESSURE_GB = cfg.ga_resource_pressure_gb
 GA_RESOURCE_CRITICAL_GB = cfg.ga_resource_critical_gb
+GA_SPAWN_PRESSURE_ESCALATE_CYCLES = cfg.ga_spawn_pressure_escalate_cycles
 GA_SUBAGENT_TIMEOUT_SECS = cfg.ga_subagent_timeout_secs
-GA_SUBAGENT_MAX_TURNS = cfg.ga_subagent_max_turns
+# Hardcoded: subagent max turns is an internal constant.
+_SUBAGENT_MAX_TURNS = 200
+GA_SUBAGENT_MAX_TURNS = _SUBAGENT_MAX_TURNS
 
 # ── Crew UI port allocation ───────────────────────────────
 # GA_DASHBOARD_PORT_ENABLED was removed; dashboard access is exclusively
@@ -448,69 +453,39 @@ GA_GIT_AUTHOR_EMAIL = os.environ.get("GA_GIT_AUTHOR_EMAIL", "").strip()
 # ── ACP backend ───────────────────────────────────────────────────────────────
 # Controls the ACP runtime used inside crew containers.
 # "kiro" (default): kiro-cli auth injection (existing behaviour).
-# "claude": skip kiro auth, inject ANTHROPIC_API_KEY from GA_CREW_ANTHROPIC_API_KEY.
-# "codex": skip kiro auth, inject OPENAI_API_KEY from GA_CREW_OPENAI_API_KEY.
-def _read_podman_secret(name: str) -> str:
-    """Read a Podman secret mounted at /run/secrets/<name>.
-
-    Returns the file contents stripped of surrounding whitespace, or "" when the
-    secret is not mounted (FileNotFoundError) or cannot be read. Mirrors the
-    _load_api_key() / _load_transport_secret() pattern so crew model keys and
-    KIRO_API_KEY are delivered as Podman secrets rather than plaintext compose
-    env vars (secret-delivery-hardening).
-    """
-    secret_path = Path("/run/secrets") / name
-    try:
-        return secret_path.read_text().strip()
-    except FileNotFoundError:
-        return ""
-    except OSError:
-        return ""
-
-
-GA_CREW_ACP_BACKEND = cfg.ga_crew_acp_backend
-# Prefer the Podman-secret file over the (now always empty) env-var value: the
-# compose template no longer carries these keys in its environment block, so
-# cfg.ga_crew_anthropic_api_key is "" in production and the secret file is the
-# real source. The env-var value is retained as the fallback for dev/test runs
-# that set GA_CREW_ANTHROPIC_API_KEY directly without a mounted secret.
-_GA_CREW_ANTHROPIC_API_KEY = cfg.ga_crew_anthropic_api_key
-_secret_value = _read_podman_secret("ga-crew-anthropic-api-key")
-if _secret_value:
-    _GA_CREW_ANTHROPIC_API_KEY = _secret_value
-_GA_CREW_ANTHROPIC_BASE_URL = cfg.ga_crew_anthropic_base_url
-# Register the Anthropic API key with the redaction filter so it is never
-# written to logs when the Claude backend is active. Registered after the
-# secret-file read so the file-sourced value is covered, not just the env var.
-if _GA_CREW_ANTHROPIC_API_KEY:
-    _security.register_secret(_GA_CREW_ANTHROPIC_API_KEY)
-_GA_CREW_OPENAI_API_KEY = cfg.ga_crew_openai_api_key
-_secret_value = _read_podman_secret("ga-crew-openai-api-key")
-if _secret_value:
-    _GA_CREW_OPENAI_API_KEY = _secret_value
-_GA_CREW_OPENAI_BASE_URL = cfg.ga_crew_openai_base_url
-# Register the OpenAI API key with the redaction filter so it is never written
-# to logs when the Codex backend is active. Registered after the secret-file
-# read so the file-sourced value is covered, not just the env var.
-if _GA_CREW_OPENAI_API_KEY:
-    _security.register_secret(_GA_CREW_OPENAI_API_KEY)
+# "claude": skip kiro auth, inject ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN).
+# "codex": skip kiro auth, inject OPENAI_API_KEY.
+GA_CREW_ACP_BACKEND = cfg.ga_crew_agent.split(",")[0].strip().lower()
+# Crew credentials come from Podman secrets mounted under /run/secrets; the
+# compose template never carries them in its environment block, so the cfg
+# values are "" in production. _security.get_secret prefers the secret file,
+# falls back to the env var for dev/test runs, and registers the value with the
+# redaction filter. lifecycle resolves the same names the same way, so both
+# modules agree on which credential a crew gets (TRN-226).
+_ANTHROPIC_API_KEY = _security.get_secret(
+    "ga-crew-anthropic-api-key", env_var="ANTHROPIC_API_KEY")
+_ANTHROPIC_BASE_URL = cfg.anthropic_base_url
+# Long-lived token from `claude setup-token`; injected as CLAUDE_CODE_OAUTH_TOKEN
+# when no Anthropic API key is set.
+_CLAUDE_CODE_OAUTH_TOKEN = _security.get_secret(
+    "ga-claude-code-oauth-token", env_var="CLAUDE_CODE_OAUTH_TOKEN")
+_OPENAI_API_KEY = _security.get_secret(
+    "ga-crew-openai-api-key", env_var="OPENAI_API_KEY")
+_OPENAI_BASE_URL = cfg.openai_base_url
 
 # ── Transport security ───────────────────────────────────────────────
 # TLS is terminated at the edge (see design.md); the app still emits HSTS and
-# security headers so protection does not depend solely on edge config. These
-# flags let each protection be toggled via config for a staged rollout and
-# config-only rollback.
+# security headers so protection does not depend solely on edge config.
 #
-# GA_TLS_MIN_VERSION: minimum TLS version enforced when the app terminates TLS
-#   directly (ssl_version passed to uvicorn). Values: "1.2" or "1.3".
 # GA_TLS_CERTFILE / GA_TLS_KEYFILE: enable direct TLS termination when set.
-# GA_ENABLE_SECURITY_HEADERS: emit baseline security headers (default on).
-# HTTPS redirect: unconditionally disabled (Caddy owns redirects).
-# CSP: unconditionally enforced (always emit CSP headers).
-GA_TLS_MIN_VERSION = cfg.ga_tls_min_version
+# Security headers and TLS min version are hardcoded — not operator-configurable.
+_TLS_MIN_VERSION = "1.2"
+# Retained as GA_TLS_MIN_VERSION for existing call sites.
+GA_TLS_MIN_VERSION = _TLS_MIN_VERSION
 GA_TLS_CERTFILE = cfg.ga_tls_certfile
 GA_TLS_KEYFILE = cfg.ga_tls_keyfile
-GA_ENABLE_SECURITY_HEADERS = cfg.ga_enable_security_headers
+# Security headers are always active — GA_ENABLE_SECURITY_HEADERS removed.
+GA_ENABLE_SECURITY_HEADERS = True
 
 # ── Caddy reverse proxy ───────────────────────────────────
 # ga-portal (Caddy) is always present: a ga-portal container owns port bindings
@@ -629,16 +604,7 @@ GA_TRANSPORT_SECRET = _load_transport_secret()
 # When set, kiro-cli authenticates via this API key and the device-code auth
 # flow is skipped entirely. Injected as an env var into crew
 # containers; unset (default) => existing device-code flow is used.
-KIRO_API_KEY = cfg.kiro_api_key
-_secret_value = _read_podman_secret("ga-kiro-api-key")
-if _secret_value:
-    KIRO_API_KEY = _secret_value
-# Register KIRO_API_KEY with the redaction filter
-# so the value is scrubbed from logs if it appears in an error or log record,
-# consistent with the GA_API_KEY pattern in _load_api_key(). Registered after
-# the secret-file read so the file-sourced value is covered, not just the env var.
-if KIRO_API_KEY:
-    _security.register_secret(KIRO_API_KEY)
+KIRO_API_KEY = _security.get_secret("ga-kiro-api-key", env_var="KIRO_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1540,6 +1506,80 @@ async def _handle_crew_dashboard_delete(request: Request) -> Response:
     return JSONResponse({"dashboard_url": None})
 
 
+async def _handle_captain_stop_post(request: Request) -> Response:
+    """POST /crews/{crew_id}/captain/stop — crew-internal captain self-cancel.
+
+    Lets Raven stop the captain check-in schedule from inside the crew
+    container. The captain schedule is a transport-registry construct and is
+    NOT visible to ``kirocrew cron list`` inside the crew, so Raven cannot pause
+    it via the CLI; this endpoint is the sanctioned path (see
+    ``_RAVEN_SELF_CANCEL``).
+
+    Auth: the crew's internal dashboard session cookie
+    (``Cookie: mc_token_5476=<value>``), the same credential Raven uses for
+    spawn calls (``/home/kirocrew/.kiro/crew/.dashboard_cookie``). This route is
+    bearer-exempt (registered in ``public_routes``); the cookie is validated
+    here against the crew's ``internal_cookie`` in the registry.
+
+    Responses:
+      - 200 ``{"status": "stopped"}``                 — schedule disabled.
+      - 400 ``{"error": "captain already stopped"}``  — entry already disabled.
+      - 404 ``{"error": "no captain entry for crew <id>"}`` — no entry.
+      - 401/403                                        — missing/invalid cookie.
+    """
+    parsed = _extract_crew_proxy_parts(request.scope["path"])
+    if parsed is None:
+        return PlainTextResponse("Not found", status_code=404)
+    crew_id, _segment, _sub = parsed
+
+    try:
+        _crew = _require_crew(crew_id)
+    except (KeyError, ValueError):
+        return JSONResponse(
+            {"error": f"no captain entry for crew {crew_id}"}, status_code=404
+        )
+
+    # ── Dashboard cookie auth ────────────────────────────────────────────────
+    # Validate the crew-internal session cookie against the registry's
+    # internal_cookie. No valid cookie → 403.
+    presented = request.cookies.get("mc_token_5476", "")
+    with _registry_lock:
+        reg = _load_registry()
+        crew_entry = reg.get("crews", {}).get(crew_id, {})
+        expected_cookie = crew_entry.get("internal_cookie", "")
+    if (
+        not expected_cookie
+        or not presented
+        or not hmac.compare_digest(presented, expected_cookie)
+    ):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    # ── Look up the captain schedule entry ───────────────────────────────────
+    with _registry_lock:
+        reg = _load_registry()
+        schedules = _get_crew_schedules(reg, crew_id)
+    captain_entry = next(
+        (s for s in schedules if s.get("type") == "captain"),
+        None,
+    )
+    if captain_entry is None:
+        return JSONResponse(
+            {"error": f"no captain entry for crew {crew_id}"}, status_code=404
+        )
+    if not captain_entry.get("enabled", False):
+        return JSONResponse(
+            {"error": "captain already stopped"}, status_code=400
+        )
+
+    # ── Disable it (same operation as captain(action="stop")) ────────────────
+    result = _captain_do_stop(crew_id)
+    if isinstance(result, dict) and result.get("error"):
+        return JSONResponse(
+            {"error": f"no captain entry for crew {crew_id}"}, status_code=404
+        )
+    return JSONResponse({"status": "stopped"})
+
+
 async def _handle_version_get(request: Request) -> Response:
     """GET /version — unauthenticated endpoint returning transport version."""
     return JSONResponse({"transport": TRANSPORT_VERSION})
@@ -1758,9 +1798,17 @@ async def _handle_logout_post(request: Request) -> Response:
                 logger.warning("Could not clear auth from crew %s: %s", cid, e)
                 wipe_failed.append(cid)
 
+    # Abort any in-progress login flow so the transport is in a clean
+    # unauthenticated state immediately after logout (TRN-205).
+    aborted = _lifecycle._abort_pending_login(podman)
+
     if wipe_failed:
-        # The stored credential is gone; these running crews may still hold a copy.
-        return JSONResponse({"status": "logged_out", "wipe_failed": wipe_failed})
+        resp: dict = {"status": "logged_out", "wipe_failed": wipe_failed}
+        if aborted:
+            resp["aborted_pending_login"] = True
+        return JSONResponse(resp)
+    if aborted:
+        return JSONResponse({"status": "logged_out", "aborted_pending_login": True})
     return JSONResponse({"status": "logged_out"})
 
 
@@ -1779,22 +1827,35 @@ def _warn_inert_backend_settings() -> None:
             ("ga-codex-auth", _codex_auth_exists()),
         ) if present
     )
-    for name in inert_backend_settings(cfg, stored):
+    # cfg holds only env values, which are "" in production for the secret-
+    # delivered credentials; check what the transport actually resolved.
+    resolved = dataclasses.replace(
+        cfg,
+        anthropic_api_key=_ANTHROPIC_API_KEY,
+        claude_code_oauth_token=_CLAUDE_CODE_OAUTH_TOKEN,
+        openai_api_key=_OPENAI_API_KEY,
+    )
+    for name in inert_backend_settings(resolved, stored):
         logger.warning(
-            "%s is set but its backend is not in GA_AGENT_BACKENDS; it has no effect.", name
+            "%s is set but its backend is not enabled in GA_CREW_AGENT; it has no effect.", name
         )
 
 
 def _backend_enabled(backend: str) -> bool:
     """True when ``backend`` is enabled. Kiro always is (bundled in every crew
-    image); the others must be listed in GA_AGENT_BACKENDS."""
-    return backend == "kiro" or backend in cfg.ga_agent_backends
+    image); others must be listed in GA_CREW_AGENT."""
+    enabled = frozenset(
+        name.strip().lower()
+        for name in cfg.ga_crew_agent.split(",")
+        if name.strip()
+    )
+    return backend == "kiro" or backend in enabled
 
 
 def _backend_not_enabled_message(backend: str) -> str:
     return (
         f"The {backend} backend is not enabled on this transport. Add {backend} to "
-        f"GA_AGENT_BACKENDS in ghostship.conf, then re-run `ghostship install`."
+        f"GA_CREW_AGENT in ghostship.conf, then re-run `ghostship install`."
     )
 
 
@@ -1806,7 +1867,7 @@ async def _handle_claude_login_post(request: Request) -> Response:
       - 409 if a Claude login flow is already in progress
       - Calls _initiate_claude_login, returns {"login_url", "code"}
 
-    Requires claude to be an enabled backend (GA_AGENT_BACKENDS), whether or
+    Requires claude to be an enabled backend (GA_CREW_AGENT), whether or
     not it is the default; returns 400 otherwise.
     """
     if not _backend_enabled("claude"):
@@ -2017,9 +2078,16 @@ async def _handle_claude_logout_post(request: Request) -> Response:
                 logger.warning("Could not wipe ~/.claude/ from crew %s: %s", cid, e)
                 wipe_failed.append(cid)
 
+    # Abort any in-progress Claude login flow (TRN-205).
+    aborted = _lifecycle._abort_claude_pending_login(podman)
+
     if wipe_failed:
-        # The stored credential is gone; these running crews may still hold a copy.
-        return JSONResponse({"status": "logged_out", "wipe_failed": wipe_failed})
+        resp: dict = {"status": "logged_out", "wipe_failed": wipe_failed}
+        if aborted:
+            resp["aborted_pending_login"] = True
+        return JSONResponse(resp)
+    if aborted:
+        return JSONResponse({"status": "logged_out", "aborted_pending_login": True})
     return JSONResponse({"status": "logged_out"})
 
 
@@ -2034,7 +2102,7 @@ async def _handle_codex_login_post(request: Request) -> Response:
       - 409 if a Codex login flow is already in progress
       - Calls _initiate_codex_login, returns {"login_url", "code"}
 
-    Requires codex to be an enabled backend (GA_AGENT_BACKENDS), whether or
+    Requires codex to be an enabled backend (GA_CREW_AGENT), whether or
     not it is the default; returns 400 otherwise.
     """
     if not _backend_enabled("codex"):
@@ -2190,9 +2258,16 @@ async def _handle_codex_logout_post(request: Request) -> Response:
                 logger.warning("Could not wipe ~/.codex/ from crew %s: %s", cid, e)
                 wipe_failed.append(cid)
 
+    # Abort any in-progress Codex login flow (TRN-205).
+    aborted = _lifecycle._abort_codex_pending_login(podman)
+
     if wipe_failed:
-        # The stored credential is gone; these running crews may still hold a copy.
-        return JSONResponse({"status": "logged_out", "wipe_failed": wipe_failed})
+        resp: dict = {"status": "logged_out", "wipe_failed": wipe_failed}
+        if aborted:
+            resp["aborted_pending_login"] = True
+        return JSONResponse(resp)
+    if aborted:
+        return JSONResponse({"status": "logged_out", "aborted_pending_login": True})
     return JSONResponse({"status": "logged_out"})
 
 
@@ -2473,10 +2548,12 @@ def launch(crew_id: str, composition: str = "spec-ops", dashboard: bool | None =
             "instructions": _backend_not_enabled_message(GA_CREW_ACP_BACKEND),
         }
     if GA_CREW_ACP_BACKEND == "claude":
-        # Task 3.3: Claude backend — require either API key or OAuth credential.
+        # Task 3.3: Claude backend — require an API key, a setup-token (TRN-226) or
+        # an OAuth credential.
         # If neither is present, initiate the Claude login flow and return
         # not_authenticated with the login URL (identical behaviour to kiro path).
-        if not _GA_CREW_ANTHROPIC_API_KEY and not _claude_auth_exists():
+        if (not _ANTHROPIC_API_KEY and not _CLAUDE_CODE_OAUTH_TOKEN
+                and not _claude_auth_exists()):
             result = _initiate_claude_login(podman)
             if result.get("login_pending"):
                 return {
@@ -2493,13 +2570,13 @@ def launch(crew_id: str, composition: str = "spec-ops", dashboard: bool | None =
                 "instructions": "Open login_url, approve, then POST the pasted code to /login/claude/code, poll GET /login/claude until complete, then call launch again.",
             }
     elif GA_CREW_ACP_BACKEND == "codex":
-        # Task 3.3: Codex backend — require either GA_CREW_OPENAI_API_KEY or a
+        # Task 3.3: Codex backend — require either OPENAI_API_KEY or a
         # non-empty ga-codex-auth OAuth credential. If neither is present,
         # initiate the Codex login flow and return not_authenticated with the
         # login URL (mirrors the Claude path). OPENAI_API_KEY/OPENAI_BASE_URL are
         # injected at container_create time; ~/.codex/ is injected via
         # _inject_codex_auth in _finish_crew_setup on the OAuth path.
-        if not _GA_CREW_OPENAI_API_KEY and not _codex_auth_exists():
+        if not _OPENAI_API_KEY and not _codex_auth_exists():
             result = _initiate_codex_login(podman)
             if result.get("login_pending"):
                 return {
@@ -2633,10 +2710,15 @@ def launch(crew_id: str, composition: str = "spec-ops", dashboard: bool | None =
         # (handled in _finish_crew_setup). Only set when non-empty — the key is
         # optional (Claude OAuth is an alternative), so we guard on its presence
         # here rather than relying on any startup validation.
-        if GA_CREW_ACP_BACKEND == "claude" and _GA_CREW_ANTHROPIC_API_KEY:
-            container_env["ANTHROPIC_API_KEY"] = _GA_CREW_ANTHROPIC_API_KEY
-            if _GA_CREW_ANTHROPIC_BASE_URL:
-                container_env["ANTHROPIC_BASE_URL"] = _GA_CREW_ANTHROPIC_BASE_URL
+        if GA_CREW_ACP_BACKEND == "claude" and _ANTHROPIC_API_KEY:
+            container_env["ANTHROPIC_API_KEY"] = _ANTHROPIC_API_KEY
+            if _ANTHROPIC_BASE_URL:
+                container_env["ANTHROPIC_BASE_URL"] = _ANTHROPIC_BASE_URL
+        # No API key: the setup-token is next in precedence (TRN-226). With it
+        # set, _finish_crew_setup skips ga-claude-auth injection, so the crew
+        # gets exactly one Claude credential.
+        elif GA_CREW_ACP_BACKEND == "claude" and _CLAUDE_CODE_OAUTH_TOKEN:
+            container_env["CLAUDE_CODE_OAUTH_TOKEN"] = _CLAUDE_CODE_OAUTH_TOKEN
         # When the Codex ACP backend is selected, inject OPENAI_API_KEY into the
         # crew container so codex-acp can authenticate against api.openai.com
         # (API-key path). The kiro auth path is skipped for Codex-backend crews
@@ -2645,10 +2727,10 @@ def launch(crew_id: str, composition: str = "spec-ops", dashboard: bool | None =
         # the value is set, independent of the API key (task 3.4) — it redirects
         # both the API-key and OAuth paths to an OpenAI-compatible endpoint.
         if GA_CREW_ACP_BACKEND == "codex":
-            if _GA_CREW_OPENAI_API_KEY:
-                container_env["OPENAI_API_KEY"] = _GA_CREW_OPENAI_API_KEY
-            if _GA_CREW_OPENAI_BASE_URL:
-                container_env["OPENAI_BASE_URL"] = _GA_CREW_OPENAI_BASE_URL
+            if _OPENAI_API_KEY:
+                container_env["OPENAI_API_KEY"] = _OPENAI_API_KEY
+            if _OPENAI_BASE_URL:
+                container_env["OPENAI_BASE_URL"] = _OPENAI_BASE_URL
         if GA_GIT_AUTHOR_NAME and GA_GIT_AUTHOR_EMAIL:
             container_env["GIT_AUTHOR_NAME"] = GA_GIT_AUTHOR_NAME
             container_env["GIT_AUTHOR_EMAIL"] = GA_GIT_AUTHOR_EMAIL
@@ -3128,6 +3210,114 @@ def nuke(crew_id: str, confirm: bool = False) -> dict:
 
 # ── Captain dispatch/steer helpers ────────────────────────────────────────────
 
+# Stable marker prefixing every memory-pressure immediate_dispatch_error string,
+# so the fire path (and tests/Raven) can classify the outcome without having to
+# re-run the probe or sniff an arbitrary message. (TRN-225)
+_MEMORY_PRESSURE_MARKER = "memory_pressure:"
+
+
+class _MemoryPressureSkip(RuntimeError):
+    """Raised when a Captain check-in dispatch is skipped (or refused) because
+    the host is under critical memory pressure. A thin RuntimeError subclass so
+    the fire path can catch it separately from any other dispatch error without
+    string-sniffing."""
+
+
+def _check_in_memory_pressure() -> float | None:
+    """Return host available memory (GB) when BELOW the critical threshold,
+    else None.
+
+    None also means "probe unavailable → fail open": when the podman client or
+    the memory reading is not available we return None so the caller dispatches
+    anyway, letting the gateway's own refusal (D4) be the backstop rather than
+    freezing the crew on a missing probe.
+    """
+    try:
+        podman = _get_podman()
+        free_gb = _get_host_memory_gb_cached(podman)
+    except Exception:
+        return None
+    if free_gb is None:
+        return None  # fail open: no probe, do not block the crew
+    return free_gb if free_gb < GA_RESOURCE_CRITICAL_GB else None
+
+
+def _is_memory_pressure_refusal(resp) -> bool:
+    """True when ``resp`` is a gateway spawn refusal caused by host memory
+    pressure (HTTP 429/503 whose body names memory pressure or insufficient
+    memory). A 503-still-spawning body (no "memory" token) is NOT a match, so it
+    stays on the normal _crew_api_with_recovery retry path."""
+    try:
+        if resp.status_code not in (429, 503):
+            return False
+        body = (resp.text or "").lower()
+    except Exception:
+        return False
+    return "memory" in body and ("pressure" in body or "insufficient" in body)
+
+
+def _mail_admiral(crew_id: str, subject: str, body: str) -> None:
+    """Deliver one message to admiral@localhost from inside the crew container
+    via /usr/local/bin/maildeliver (the atomic Maildir delivery path documented
+    in STANDING_ORDERS.md). Best-effort: a delivery failure is logged, never
+    raised, so an escalation attempt cannot break the fire path."""
+    try:
+        crew = _require_crew(crew_id)
+        container = crew.get("container")
+        if not container:
+            logger.warning("Admiral escalation for crew %s: no container to deliver mail", crew_id)
+            return
+        from datetime import datetime as _dt, timezone as _tz
+        import uuid as _uuid
+
+        header_ts = _dt.now(_tz.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+        message = (
+            f"From: transport@localhost\r\n"
+            f"To: admiral@localhost\r\n"
+            f"Subject: {subject}\r\n"
+            f"Message-ID: <{_uuid.uuid4()}@localhost>\r\n"
+            f"Date: {header_ts}\r\n"
+            f"\r\n"
+            f"{body}\r\n"
+        ).encode("utf-8")
+        podman = _get_podman()
+        podman.container_exec_stdin(
+            container,
+            ["/usr/local/bin/maildeliver", "admiral@localhost"],
+            message,
+        )
+    except Exception as exc:
+        logger.warning("Admiral escalation mail for crew %s failed: %s", crew_id, exc)
+
+
+def _record_memory_pressure_cycle(crew_id: str) -> None:
+    """Increment the captain schedule's consecutive_memory_pressure_skips counter
+    (treating a missing field as 0), persist it under _registry_lock, and fire a
+    single edge-triggered Admiral escalation when the post-increment value EQUALS
+    GA_SPAWN_PRESSURE_ESCALATE_CYCLES (so it mails exactly once on the crossing,
+    not on every subsequent cycle while the counter stays at/above the bound)."""
+    n = 0
+    with _registry_lock:
+        reg = _load_registry()
+        for s in _get_crew_schedules(reg, crew_id):
+            if s.get("type") == "captain":
+                n = int(s.get("consecutive_memory_pressure_skips", 0) or 0) + 1
+                s["consecutive_memory_pressure_skips"] = n
+                break
+        _save_registry(reg)
+    if n == GA_SPAWN_PRESSURE_ESCALATE_CYCLES:
+        _mail_admiral(
+            crew_id,
+            subject=f"captain check-in deferred — sustained memory pressure {crew_id}",
+            body=(
+                f"{n} consecutive check-in cycles for crew {crew_id} were "
+                f"deferred because host available memory stayed below "
+                f"{GA_RESOURCE_CRITICAL_GB}GB. SDD progress is paused until "
+                f"memory pressure drops."
+            ),
+        )
+
+
 def _dispatch_captain_checkin(
     crew: dict,
     crew_id: str,
@@ -3209,7 +3399,45 @@ def _dispatch_captain_checkin(
             model = crew_model
     if model is not None:
         spawn_body["model"] = model
-    result = _crew_api_with_recovery(crew, crew_id, "POST", "/api/spawn", json=spawn_body)
+    # Pre-dispatch host-memory probe (TRN-225): skip the spawn WITHOUT calling
+    # /api/spawn when the host is under critical memory pressure. Fail-open when
+    # the probe is unavailable (helper returns None).
+    low_gb = _check_in_memory_pressure()
+    if low_gb is not None:
+        logger.warning(
+            "Captain check-in for crew %s deferred: host at %sGB free "
+            "(< %sGB critical) — memory pressure",
+            crew_id, low_gb, GA_RESOURCE_CRITICAL_GB,
+        )
+        raise _MemoryPressureSkip(
+            f"{_MEMORY_PRESSURE_MARKER} host at {low_gb}GB free "
+            f"(< {GA_RESOURCE_CRITICAL_GB}GB critical) — check-in deferred"
+        )
+    # A gateway-side memory-pressure refusal (one that slipped past the probe
+    # because the gateway threshold is stricter) is re-raised as the same typed
+    # skip and NOT routed through _crew_api_with_recovery's in-cycle retries.
+    #
+    # Note: _crew_api_with_recovery's _phase0_transient_503 retries all 503
+    # responses up to 4× before re-raising. When the gateway returns a
+    # memory-pressure 503, phase0 will retry it 4× (~4 s) before the error
+    # propagates here for classification. The probe (D3) prevents this in the
+    # common case (same threshold on both sides); the retry overhead only occurs
+    # in the narrow window where the gateway's threshold is stricter than
+    # GA_RESOURCE_CRITICAL_GB. Fixing this properly requires a body-check inside
+    # _phase0_transient_503 (lifecycle.py), which is outside this change's
+    # declared footprint; tracked as a follow-on for lifecycle.py.
+    try:
+        result = _crew_api_with_recovery(crew, crew_id, "POST", "/api/spawn", json=spawn_body)
+    except httpx.HTTPStatusError as exc:
+        if _is_memory_pressure_refusal(exc.response):
+            logger.warning(
+                "Captain check-in for crew %s refused by gateway under memory pressure",
+                crew_id,
+            )
+            raise _MemoryPressureSkip(
+                f"{_MEMORY_PRESSURE_MARKER} gateway refused spawn under memory pressure"
+            ) from exc
+        raise
     task_id = result.get("id") if isinstance(result, dict) else None
     if not task_id:
         raise RuntimeError(
@@ -3274,12 +3502,32 @@ def _steer_captain_checkin(
     except Exception as exc:
         err_str = str(exc)
         # /continue returns 404 with code "conversation_gone" when the session
-        # is no longer available (container restart, etc.)
-        if "conversation_gone" in err_str or "404" in err_str:
+        # is no longer available (container restart, etc.).
+        # TRN-230: /continue also returns 400 Bad Request when the Raven task
+        # has completed and its session is gone — _crew_api_with_recovery now
+        # re-raises this as a raw HTTPStatusError rather than routing to
+        # phase-1 stale-cookie recovery.  Treat it the same as 404: fall back
+        # to a fresh dispatch and clear the stale current_task_id.
+        if "conversation_gone" in err_str or "404" in err_str or ("400 Bad Request" in err_str and "/continue" in err_str):
             logger.info(
-                "Captain check-in: session %s gone for crew %s — re-dispatching",
+                "Captain check-in: session %s gone for crew %s (400/404) — re-dispatching",
                 current_task_id, crew_id,
             )
+            # Clear the stale current_task_id so the next monitor tick doesn't
+            # retry this dead session.
+            try:
+                with _registry_lock:
+                    reg = _load_registry()
+                    for s in _get_crew_schedules(reg, crew_id):
+                        if s.get("type") == "captain":
+                            s["current_task_id"] = None
+                            break
+                    _save_registry(reg)
+            except Exception as clear_exc:
+                logger.warning(
+                    "Captain check-in: could not clear current_task_id for crew %s: %s",
+                    crew_id, clear_exc,
+                )
             return _dispatch_captain_checkin(crew, crew_id, model=effective_model)
         # /continue returns 409 with code "conversation_busy" when mid-turn
         if "conversation_busy" in err_str or "409" in err_str:
@@ -3473,11 +3721,22 @@ def _captain_do_order(
                         if s.get("type") == "captain":
                             s["current_task_id"] = new_task_id
                             s["next_fire_at"] = fired_next
+                            # Successful dispatch clears any accumulated
+                            # memory-pressure skips so a later sustained-pressure
+                            # run re-arms the Admiral escalation. (TRN-225)
+                            s["consecutive_memory_pressure_skips"] = 0
                             from datetime import datetime as _dt, timezone as _tz
                             s["last_checkin_at"] = _dt.now(_tz.utc).isoformat()
                             break
                     _save_registry(reg)
                 result["current_task_id"] = new_task_id
+            except _MemoryPressureSkip as exc:
+                # Memory-pressure skip/refusal: do NOT advance current_task_id
+                # (so the dispatch is retried on a later cycle), count the cycle,
+                # and let _record_memory_pressure_cycle handle edge-triggered
+                # Admiral escalation. (TRN-225)
+                result["immediate_dispatch_error"] = str(exc)
+                _record_memory_pressure_cycle(crew_id)
             except Exception as exc:
                 result["immediate_dispatch_error"] = str(exc)
         elif not is_new_entry and existing_entry is not None:
@@ -3942,9 +4201,20 @@ def schedule(
             }
             if model is not None:
                 immediate_body["model"] = model
-            _crew_api_with_recovery(
-                crew, crew_id, "POST", "/api/spawn", json=immediate_body,
-            )
+            try:
+                _crew_api_with_recovery(
+                    crew, crew_id, "POST", "/api/spawn", json=immediate_body,
+                )
+            except httpx.HTTPStatusError as exc:
+                # Classify a gateway memory-pressure refusal consistently with the
+                # captain path: tag it with the stable marker so callers/Raven can
+                # recognise it. No counter here — generic scheduled jobs have no
+                # captain escalation. (TRN-225)
+                if _is_memory_pressure_refusal(exc.response):
+                    raise _MemoryPressureSkip(
+                        f"{_MEMORY_PRESSURE_MARKER} gateway refused spawn under memory pressure"
+                    ) from exc
+                raise
         except Exception as exc:
             result["immediate_dispatch_error"] = str(exc)
 
@@ -4592,8 +4862,8 @@ if __name__ == "__main__":
 
     logger.info("Starting transport MCP server on %s:%d", HOST, PORT)
     logger.info("Idle timeout: %ds", GA_IDLE_TIMEOUT_SECS)
-    logger.info("Agent backends enabled: %s (default: %s)",
-                ", ".join(sorted(cfg.ga_agent_backends)), GA_CREW_ACP_BACKEND)
+    logger.info("Agent backend: %s (runtime default: %s)",
+                cfg.ga_crew_agent, GA_CREW_ACP_BACKEND)
     _warn_inert_backend_settings()
     _reconcile_registry()
     # Restore UI port allocations from persisted registry so restarts
@@ -4654,6 +4924,7 @@ if __name__ == "__main__":
         ("GET",  "/dashboard/auth"): _dashboard_gate.handle_auth,
         ("GET",  "/dashboard/login"): _dashboard_gate.handle_login_get,
         ("GET",  "/openapi.json"): _handle_openapi_get,
+        ("POST", "/crews/*/captain/stop"): _handle_captain_stop_post,
     }
     _openapi_schema = _openapi.generate_schema(
         routes=_openapi_schema_routes,
@@ -4696,6 +4967,9 @@ if __name__ == "__main__":
             # without Caddy's forward-auth check having passed first.
             ("GET",  "/crews/*/ui"): _handle_crew_ui_proxy,
             ("WS",   "/crews/*/ui"): _handle_crew_ui_ws_proxy,
+            # Crew-internal captain self-cancel — bearer-exempt; the handler
+            # validates the crew's internal dashboard session cookie itself.
+            ("POST", "/crews/*/captain/stop"): _handle_captain_stop_post,
         },
     )
     # Rate-limit wrapper: sits OUTSIDE BearerAuthMiddleware so all

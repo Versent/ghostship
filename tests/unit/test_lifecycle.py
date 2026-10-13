@@ -1428,7 +1428,7 @@ class LoginLogoutTests(unittest.TestCase):
             patch.object(lifecycle, "_start_login_container", return_value=container_name),
             patch.object(lifecycle, "select") as mock_select,
             patch.object(podman, "container_exec", return_value="kiro-cli"),
-            patch.object(podman, "container_exec_pty_stdin", return_value=(exec_id, fake_sock)),
+            patch.object(podman, "container_exec_pty_stdin", return_value=(exec_id, fake_sock, b"")),
         ):
             mock_select.select.return_value = ([fake_sock], [], [])
             request = Mock()
@@ -1493,7 +1493,7 @@ class LoginLogoutTests(unittest.TestCase):
             patch.object(
                 podman,
                 "container_exec_pty_stdin",
-                return_value=(exec_id, fake_sock),
+                return_value=(exec_id, fake_sock, b""),
             ),
         ):
             mock_select.select.return_value = ([fake_sock], [], [])
@@ -1554,7 +1554,7 @@ class LoginLogoutTests(unittest.TestCase):
             patch.object(server, "time") as mock_time,
             patch.object(lifecycle, "select") as mock_select,
             patch.object(podman, "container_exec", return_value="kiro-cli"),
-            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-fail", fake_sock)),
+            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-fail", fake_sock, b"")),
         ):
             mock_time.time.side_effect = [1000.0, 1000.0, 1016.0]
             mock_select.select.return_value = ([fake_sock], [], [])
@@ -1700,7 +1700,7 @@ class LoginFlowEdgeCaseTests(unittest.TestCase):
             patch.object(server, "time") as mock_time,
             patch.object(lifecycle, "select") as mock_select,
             patch.object(podman, "container_exec", return_value="kiro-cli"),
-            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-x", fake_sock)),
+            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-x", fake_sock, b"")),
         ):
             mock_time.time.side_effect = [1000.0, 1000.0, 1016.0]
             mock_select.select.return_value = ([fake_sock], [], [])
@@ -1733,7 +1733,7 @@ class LoginFlowEdgeCaseTests(unittest.TestCase):
             patch.object(lifecycle, "select") as mock_select,
             patch.object(lifecycle, "KIRO_REGION", "us-west-2"),
             patch.object(podman, "container_exec", return_value="kiro-cli"),
-            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-r", fake_sock)),
+            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-r", fake_sock, b"")),
         ):
             mock_select.select.return_value = ([fake_sock], [], [])
             request = Mock()
@@ -1783,7 +1783,7 @@ class LoginFlowEdgeCaseTests(unittest.TestCase):
             patch.object(server, "time") as mock_time,
             patch.object(lifecycle, "select") as mock_select,
             patch.object(podman, "container_exec", return_value="kiro-cli"),
-            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-pty45", fake_sock)),
+            patch.object(podman, "container_exec_pty_stdin", return_value=("exec-pty45", fake_sock, b"")),
         ):
             # Simulate: start=1000, first deadline check=1000 (inside loop),
             # second check=1046 (past 45s deadline) — loop exits, error returned.
@@ -2055,8 +2055,8 @@ class AdmiralSecretHardeningTests(unittest.TestCase):
         self.assertEqual(result.get("pre_warm_status"), "warmed")
         self.assertEqual(result.get("pre_warm_task_id"), "abc123")
 
-    def test_finish_crew_setup_skips_prewarm_when_disabled(self) -> None:
-        """_finish_crew_setup skips _prewarm_crew when GA_PREWARM_ENABLED=false."""
+    def test_finish_crew_setup_always_calls_prewarm(self) -> None:
+        """_finish_crew_setup always calls _prewarm_crew (GA_PREWARM_ENABLED gate removed, TRN-213)."""
         inject_policy_calls: list = []
         admiral_secret_calls: list = []
 
@@ -2066,12 +2066,10 @@ class AdmiralSecretHardeningTests(unittest.TestCase):
             prewarm_calls.append(crew_id)
             return {"status": "warmed"}
 
-        with patch.object(lifecycle, "GA_PREWARM_ENABLED", False), \
-             patch.object(lifecycle, "_prewarm_crew", side_effect=fake_prewarm):
+        with patch.object(lifecycle, "_prewarm_crew", side_effect=fake_prewarm):
             _, result = self._run_finish_crew_setup(inject_policy_calls, admiral_secret_calls)
 
-        self.assertEqual(prewarm_calls, [], "_prewarm_crew must not be called when disabled")
-        self.assertNotIn("pre_warm_status", result)
+        self.assertEqual(prewarm_calls, ["demo"], "_prewarm_crew must always be called")
 
     def test_finish_crew_setup_prewarm_failure_is_nonfatal(self) -> None:
         """A prewarm error must not prevent launch from succeeding."""
@@ -2120,12 +2118,19 @@ class PatchCrewConfigTests(unittest.TestCase):
         return _json.loads(base64.b64decode(overrides_b64).decode())
 
     def test_patch_crew_config_sets_sandbox_off(self) -> None:
-        """sandbox_allow_unsandboxed_exec must be True -- under Podman rootless
-        the kernel denies the MS_REMOUNT bind mount that kiro-cli 0.7.0+
-        requires to seal credential directories (EPERM inside a user namespace).
-        KiroCrew 0.7.0 replaced the broad ``sandbox: "off"`` with the more
-        targeted ``sandbox_allow_unsandboxed_exec: true`` escape hatch, which
-        skips only the failing bind-mount step while keeping other guards.
+        """sandbox: "off" and sandbox_allow_unsandboxed_exec must both be set.
+
+        Under Podman rootless the kernel denies the namespace/mount operations
+        KiroCrew 0.9.0 uses to seal credential directories. Two keys are needed:
+
+        - ``sandbox: "off"`` causes wrap_argv() to return the unmodified argv
+          immediately, bypassing the sandbox launcher entirely. This is needed
+          because ``sandbox_allow_unsandboxed_exec`` alone only gates the
+          *cached-failure* path (populated after a prior failed probe), so the
+          first agent spawn on a fresh crew would still fail without this.
+
+        - ``sandbox_allow_unsandboxed_exec: true`` is belt-and-suspenders for
+          subsequent spawns and for the ACP runtime's independent config reads.
 
         The full_overrides dict nests agent keys under
         ``full_overrides["agent"]`` rather than at the top level."""
@@ -2137,10 +2142,10 @@ class PatchCrewConfigTests(unittest.TestCase):
             f"Expected agent.sandbox_allow_unsandboxed_exec=True but got: "
             f"{agent.get('sandbox_allow_unsandboxed_exec')!r}",
         )
-        self.assertNotIn(
-            "sandbox",
-            agent,
-            "agent.sandbox should not be set — use sandbox_allow_unsandboxed_exec instead",
+        self.assertEqual(
+            agent.get("sandbox"),
+            "off",
+            f"Expected agent.sandbox='off' but got: {agent.get('sandbox')!r}",
         )
 
     def test_patch_crew_config_sets_dangerously_skip_permissions(self) -> None:
@@ -2256,6 +2261,69 @@ class PatchCrewConfigTests(unittest.TestCase):
             14400,
             f"Expected orchestrator.max_plan_duration_seconds >= 14400 but got: {duration!r}",
         )
+
+    def test_patch_crew_config_sets_memory_store_default(self) -> None:
+        """Every agent entry in agents comprehension must carry memory_store: "default".
+
+        Under KiroCrew 0.9.0+ "default" is a store *selector* with no ordering
+        assumption — the gateway switches internally to vector-similarity
+        retrieval, but the string "default" is still accepted without
+        modification (TRN-224 spec: crew-member-enrollment requirement,
+        scenario 'memory_store "default" accepted under KiroCrew 0.9.0').
+
+        This test guards against the key being renamed, dropped, or changed to
+        an ordering-specific identifier in a future refactor.
+        """
+        import base64
+        import json as _json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        exec_calls: list[list[str]] = []
+
+        class CapturingPodman:
+            def container_exec(
+                self, container: str, cmd: list[str], env: dict | None = None
+            ) -> str:
+                exec_calls.append(cmd)
+                return "patched config.local.json"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agents_dir = Path(tmp) / "agents"
+            agents_dir.mkdir()
+            # Create two stub agent JSON files so the comprehension produces
+            # at least one entry — any non-empty glob result is sufficient.
+            (agents_dir / "ghost.json").write_text("{}")
+            (agents_dir / "spectre.json").write_text("{}")
+
+            real_path = Path
+
+            def _path_factory(p):
+                if str(p) == "/agents":
+                    return agents_dir
+                return real_path(p)
+
+            with patch("transport.lifecycle.Path", side_effect=_path_factory):
+                lifecycle._patch_crew_config(CapturingPodman(), "gs-demo")
+
+        self.assertTrue(exec_calls, "container_exec was never called")
+        cmd = exec_calls[0]
+        overrides_b64 = cmd[-1]
+        overrides = _json.loads(base64.b64decode(overrides_b64).decode())
+
+        agents: dict = overrides.get("agents", {})
+        self.assertTrue(
+            agents,
+            "Expected 'agents' section in full_overrides but it was absent or empty",
+        )
+        for slug, agent_cfg in agents.items():
+            self.assertEqual(
+                agent_cfg.get("memory_store"),
+                "default",
+                f"Expected agents[{slug!r}].memory_store='default' but got: "
+                f"{agent_cfg.get('memory_store')!r}",
+            )
 
 
 # ── schedule monitor gateway source-of-truth ────────────────────────

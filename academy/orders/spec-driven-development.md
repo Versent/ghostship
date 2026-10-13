@@ -59,9 +59,11 @@ Once the idempotency check confirms no prior intent is active, generate a unique
 
 After writing the pending marker, re-scan `raven@localhost`. If another unconfirmed pending marker for the same persona is older (compare Maildir arrival/`Date`, then `Message-ID` for a tie), hold; only the oldest marker proceeds. This post-write election prevents overlapping check-ins from both spawning. The winning check-in calls the authenticated `/api/spawn` (pass both `X-Internal-Secret` from `.local_secret` and `X-Session-Key: $KIRO_SESSION_ID`), then immediately writes a confirmation message with subject `dispatching <persona> <spawn_task_id>` using the ID returned by the gateway; include the `intent_id` in its body to link the two records. If `/api/spawn` fails, write no confirmation and let the pending marker become stale only after the subsequent confirmation check described above.
 
+**Spawn refused under memory pressure.** A `/api/spawn` call may be refused by the gateway when the host is under critical memory pressure (an HTTP 503/429 whose body names memory pressure or insufficient memory; the transport tags such an outcome with the stable `memory_pressure:` marker). Treat this exactly like any other failed spawn — write no confirmation and leave the pending intent marker so the dispatch is retried on a later check-in — but ALSO count it. Do not treat a memory-pressure refusal as a completed dispatch, and do not retry it within the same cycle. If memory-pressure refusals recur on `GA_SPAWN_PRESSURE_ESCALATE_CYCLES` (default 3) consecutive check-in cycles for the same dispatch, mail `admiral@localhost` with subject `captain check-in deferred — sustained memory pressure <crew_id>` (substituting the actual crew id) and then hold until pressure drops.
+
 ## Lifecycle rules
 
-Apply these rules to each change independently (in multi-change mode, one check-in dispatches at most one persona for one change):
+Apply these rules to each change independently (in multi-change mode, one check-in MAY dispatch one persona per change — each change is acted on independently and in parallel):
 
 - If the proposal, design, specs, or tasks artifact is not complete, dispatch Spectre to continue proposing or updating the change. Take no other dispatching action in that check-in.
 - Once planning is complete, if tasks.md has any unchecked item, dispatch Ghost to implement the remaining tasks.
@@ -96,4 +98,4 @@ Raven dispatches Ghost for this task using the same intent-UUID idempotency patt
 
 Note: exit code 2 from `verify-admiral-sig` indicates a transient race condition — the signing secret file was not found after retries (typically during container startup). Raven should hold the current cycle and not escalate to Admiral; the secret will be available on the next scheduled check-in.
 
-Each check-in takes exactly one action: dispatch at most one of Ghost, Spectre, Banshee, Wraith, or Reaper using the authenticated REST dispatch described above; hold when no action is needed; or message the Admiral when permission or a decision outside your authority is required. Do not use `kirocrew spawn run` for named persona dispatch. Do not implement work yourself, edit files, or change these standing orders through another channel.
+Each check-in takes at most one action per change: in multi-change mode dispatch at most one persona per change per check-in (all changes may be acted on in the same check-in); in single-change mode dispatch at most one persona total. Hold when no action is needed; message the Admiral when permission or a decision outside your authority is required. Do not use `kirocrew spawn run` for named persona dispatch. Do not implement work yourself, edit files, or change these standing orders through another channel.
