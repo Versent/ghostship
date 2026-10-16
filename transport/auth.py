@@ -428,22 +428,6 @@ class BearerAuthMiddleware(AsyncMiddlewareBase):
                 await response(scope, receive, send)
                 return True
 
-        # Pattern match for POST /crews/{id}/captain/stop — bearer-exempt; the
-        # handler validates the crew's internal dashboard cookie itself.
-        if (
-            scope["method"] == "POST"
-            and len(_parts) == 4
-            and _parts[0] == "crews"
-            and _parts[2] == "captain"
-            and _parts[3] == "stop"
-        ):
-            stop_handler = self._public_routes.get(("POST", "/crews/*/captain/stop"))
-            if stop_handler is not None:
-                request = Request(scope, receive)
-                response = await stop_handler(request)
-                await response(scope, receive, send)
-                return True
-
         return False
 
     async def _dispatch_file(self, scope, receive, send) -> bool:
@@ -763,9 +747,13 @@ class SecurityHeadersMiddleware:
             await self.app(scope, receive, send)
             return
 
+        nonce = _security.generate_csp_nonce()
+        scope["csp_nonce"] = nonce
+
         extra = _security.security_headers(
             https=https,
             csp_report_only=not self._csp_enforce,
+            nonce=nonce,
         )
 
         async def send_wrapper(message):

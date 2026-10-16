@@ -556,35 +556,43 @@ The spec-ops image SHALL record its toolchain list in the `org.ghostship.toolcha
 - **WHEN** the existing image's label equals the new `AGENT_TOOLCHAINS` value and the version is unchanged
 - **THEN** `install.sh` does not force a cache-less spec-ops build on account of the toolchains
 
-### Requirement: Unauthenticated non-loopback bind warning
+### Requirement: GA_REQUIRE_API_KEY defaults to error on non-loopback installs
+The `GA_REQUIRE_API_KEY` setting SHALL default to `error` (changed from `warn`). When `HOST` is unset or `127.0.0.1`, the check SHALL be skipped entirely — no API key is required for loopback installs. When `HOST` is any non-loopback value and `GA_API_KEY` is not set, the install SHALL abort with an error message directing the operator to set `GA_API_KEY` or use `GA_REQUIRE_API_KEY=off`. Setting `GA_REQUIRE_API_KEY=off` SHALL allow unauthenticated remote access (for deployments that place their own auth layer in front). The `warn` mode MAY be removed in a future release.
+
 `install.sh` SHALL emit a prominent `WARNING` to stderr when `GA_API_KEY` is not
 set (or empty) **and** the published host port maps to a non-loopback address
 (i.e. anything other than `127.0.0.1` or `::1`). The default published address
-is `0.0.0.0`, which triggers the warning. The warning SHALL name the port, state
+is `0.0.0.0`, which triggers the check. The warning SHALL name the port, state
 that MCP endpoints are accessible to any host that can reach the machine, and
 direct the operator to pass `--api-key` or set `GA_REQUIRE_API_KEY=off` to
 silence it.
 
 `GA_REQUIRE_API_KEY` controls the severity of the check:
-- `warn` (default) — print warning and continue.
-- `error` — print warning and exit non-zero.
+- `error` (default) — print warning and exit non-zero.
+- `warn` — print warning and continue (deprecated; may be removed in a future release).
 - `off` — skip the check entirely.
 
 The transport process SHALL also log a `WARNING`-level message at startup when
 `GA_API_KEY` is absent and the `HOST` environment variable is not a loopback
 address (`127.0.0.1` or `::1`).
 
-#### Scenario: Default install without API key on non-loopback address emits warning
-- **WHEN** `install.sh` runs without `--api-key`, `GA_REQUIRE_API_KEY` is unset
-  or `warn`, and the published port maps to `0.0.0.0`
+#### Scenario: Remote install without API key aborts
+- **WHEN** `install.sh` is run with `HOST=0.0.0.0` and `GA_API_KEY` is not set and `GA_REQUIRE_API_KEY` is not `off`
+- **THEN** the install aborts with a non-zero exit code before starting any containers, and the error message names `GA_API_KEY` and `GA_REQUIRE_API_KEY=off` as the resolution paths
+
+#### Scenario: Local install without API key succeeds
+- **WHEN** `install.sh` is run with `HOST=127.0.0.1` (or `HOST` unset) and `GA_API_KEY` is not set
+- **THEN** the install completes normally and the transport starts without authentication
+
+#### Scenario: Remote install with GA_REQUIRE_API_KEY=off succeeds
+- **WHEN** `install.sh` is run with `HOST=0.0.0.0`, `GA_API_KEY` not set, and `GA_REQUIRE_API_KEY=off`
+- **THEN** the install completes normally with a warning logged that the transport is unauthenticated
+
+#### Scenario: GA_REQUIRE_API_KEY=warn without API key on non-loopback address emits warning and continues
+- **WHEN** `install.sh` runs without `--api-key`, `GA_REQUIRE_API_KEY=warn`,
+  and the published port maps to `0.0.0.0`
 - **THEN** `install.sh` prints a WARNING to stderr naming the port and stating
   that unauthenticated access is enabled, and installation continues
-
-#### Scenario: GA_REQUIRE_API_KEY=error without API key exits
-- **WHEN** `install.sh` runs without `--api-key`, `GA_REQUIRE_API_KEY=error`,
-  and the published port maps to a non-loopback address
-- **THEN** `install.sh` prints the same WARNING to stderr and exits non-zero
-  before writing compose.yml
 
 #### Scenario: GA_REQUIRE_API_KEY=off suppresses the check
 - **WHEN** `install.sh` runs without `--api-key` and `GA_REQUIRE_API_KEY=off`
@@ -600,6 +608,13 @@ address (`127.0.0.1` or `::1`).
   to a non-loopback address
 - **THEN** the transport logs a `WARNING`-level message stating that no API key
   is configured and MCP endpoints are accessible without authentication
+
+### Requirement: Transport startup enforces GA_REQUIRE_API_KEY=error
+The transport SHALL re-check the `GA_REQUIRE_API_KEY` constraint at startup. If `GA_REQUIRE_API_KEY` is `error` (or unset, i.e. default) and the bind address is non-loopback and no API key secret is present, the transport SHALL refuse to start and exit with a non-zero code.
+
+#### Scenario: Transport refuses to start unauthenticated on non-loopback
+- **WHEN** the transport starts with a non-loopback bind address and no `ga-api-key` secret and `GA_REQUIRE_API_KEY` is not `off`
+- **THEN** the transport exits immediately with a logged error naming the missing API key
 
 ### Requirement: GA_REQUIRE_API_KEY and GA_TRUSTED_PROXY documented in configuration docs
 `docs/configuration.md` SHALL include entries for `GA_REQUIRE_API_KEY` (its three
@@ -815,3 +830,72 @@ unconditionally.
 #### Scenario: Standard name wins
 - **WHEN** `ghostship.conf` sets both `ANTHROPIC_API_KEY` and `GA_CREW_ANTHROPIC_API_KEY`
 - **THEN** `install.sh` uses `ANTHROPIC_API_KEY` and warns that the old name is ignored
+
+### Requirement: Interactive guided setup when no ghostship.conf exists
+When `install.sh` is run and no `ghostship.conf` exists in the current directory (or `--setup` flag is passed), the installer SHALL enter an interactive guided setup mode. The existing non-interactive path SHALL be unchanged when a `ghostship.conf` is present.
+
+#### Scenario: Interactive mode triggered on first install
+- **WHEN** `install.sh` is run and no `ghostship.conf` is found
+- **THEN** the installer enters interactive guided setup and prompts the operator for configuration before building
+
+#### Scenario: Non-interactive path unchanged when conf exists
+- **WHEN** `install.sh` is run and a `ghostship.conf` exists
+- **THEN** the installer proceeds non-interactively as before, without any prompts
+
+### Requirement: Interactive setup collects backend and non-secret config
+The interactive setup SHALL prompt the operator to choose a default agent backend (`kiro` default, `claude`, `codex`) and optional additional backends, then collect only the non-secret config for the selected backends (`KIRO_IDENTITY_PROVIDER`/`KIRO_REGION` for kiro; nothing for claude; `OPENAI_BASE_URL` for codex). Collected values SHALL be written to a new `ghostship.conf` (mode `600`, non-empty vars only, no secrets) before the build proceeds. Secret injection (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`) SHALL be deferred to `ghostship auth login <backend>`.
+
+#### Scenario: Selecting kiro backend prompts for identity provider
+- **WHEN** the operator selects `kiro` as the backend
+- **THEN** the installer prompts for `KIRO_IDENTITY_PROVIDER` and (when a provider is given) `KIRO_REGION` and writes them to `ghostship.conf`
+
+#### Scenario: Selecting claude backend collects no secret config
+- **WHEN** the operator selects `claude` as a backend
+- **THEN** the installer collects no config and instructs the operator to run `ghostship auth login anthropic` after install
+
+#### Scenario: Multiple backends enabled simultaneously
+- **WHEN** the operator selects `kiro` as default and adds `claude,codex`
+- **THEN** `GA_CREW_AGENT=kiro,claude,codex` is written to `ghostship.conf` with `kiro` as the runtime default
+
+### Requirement: Interactive setup runs login flow after transport starts
+After the transport is started successfully, the interactive setup SHALL automatically trigger the login flow for the selected backend and display the login URL or device code to the operator. The installer SHALL wait for login completion before exiting, so the operator finishes the install already authenticated.
+
+#### Scenario: Login flow triggered automatically after install
+- **WHEN** interactive setup completes the build and starts the transport
+- **THEN** the appropriate login flow is started automatically and the operator is shown the login URL or device code without a separate manual step
+
+### Requirement: Interactive setup offers harness registration
+After login completes, the interactive setup SHALL offer to run `ghostship setup` to register the MCP server with detected harnesses (kiro-cli, Claude Code, opencode). The operator can accept or skip.
+
+#### Scenario: Harness registration is optional
+- **WHEN** the operator declines harness registration during interactive setup
+- **THEN** the install completes normally without running `ghostship setup`
+
+## Interactive Setup Mode
+
+### Trigger
+
+Interactive guided setup runs when **either**:
+- no `ghostship.conf` is found (neither `ghostship.conf` nor `config/ghostship.conf`) **and** stdin is a tty (`-t 0`); or
+- the `--wizard` flag is passed (regardless of whether a config exists).
+
+Otherwise the installer runs the existing non-interactive path unchanged.
+
+### The seven steps
+
+1. **Default backend** — prompt for `kiro`/`claude`/`codex` (default `kiro`); validate against the known set and re-prompt on an unknown value.
+2. **Additional backends** — prompt for a comma-separated list (blank = none); validate each and append to `GA_CREW_AGENT` so all selected backends are enabled.
+3. **Non-secret config per backend** — kiro: optional `KIRO_IDENTITY_PROVIDER` and, if set, `KIRO_REGION`; claude: none (printed note to run `ghostship auth login anthropic`); codex: optional `OPENAI_BASE_URL` (blank = OpenAI; may point at a local proxy such as litellm) plus a printed note to run `ghostship auth login openai`.
+4. **Write `ghostship.conf`** — `${GHOSTSHIP_DIR}/config/ghostship.conf`, mode `600`, containing only the non-empty non-secret vars and a generation header. This file is sourced by the auto-detect loop on every subsequent `./install.sh`.
+5. **Build & start** — the collected `GA_CREW_AGENT` feeds the existing `agent_backends_normalise` call and the normal build/transport-start path, unchanged.
+6. **Authentication** — after `✓ Transport is ready`, kiro triggers `ghostship auth login` (device flow); claude and codex print the follow-up `ghostship auth login <backend>` command.
+7. **Harness registration** — prompt (default `y`) to run `ghostship setup`, registering the MCP server with detected harnesses (kiro-cli, Claude Code, opencode). Declining skips it; the install still completes.
+
+### Multi-backend topology
+
+`GA_CREW_AGENT` is comma-separated and the transport holds config for all listed backends simultaneously (e.g. `GA_CREW_AGENT=kiro,claude,codex`). The **first** entry is the runtime default. The interactive installer surfaces this: a default backend plus any additional backends are enabled in one install.
+
+### Invariants
+
+- The non-interactive path (config present, no `--wizard`) is **unchanged** — no new prompts, no behavior change.
+- No secrets are collected or written during interactive setup. Secret injection is deferred to `ghostship auth login <backend>`.

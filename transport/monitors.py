@@ -51,6 +51,7 @@ try:
         _get_crew_schedules,
         _advance_next_fire_at,
         _touch_crew,
+        registry,
     )
 except ModuleNotFoundError:
     from transport.registry import (  # local dev
@@ -61,6 +62,7 @@ except ModuleNotFoundError:
         _get_crew_schedules,
         _advance_next_fire_at,
         _touch_crew,
+        registry,
     )
 
 # CREW_GATEWAY_PORT is a plain integer constant with no transport dependencies,
@@ -71,6 +73,19 @@ try:
     from constants import CREW_GATEWAY_PORT  # container: flat /app/
 except ModuleNotFoundError:
     from transport.constants import CREW_GATEWAY_PORT  # local dev
+
+# Captain dispatch/steer engine. These used to be defined in server.py and were
+# imported at call time inside _captain_monitor to dodge the monitors<->server
+# load cycle. They now live in the captain_engine leaf (TRN-242), so a plain
+# top-level import is cycle-safe — captain_engine does not import monitors or
+# server. These are NOT injected via bind_lifecycle(); they are direct imports.
+try:
+    from captain_engine import _steer_captain_checkin, _dispatch_captain_checkin  # container: flat /app/
+except ModuleNotFoundError:
+    from transport.captain_engine import (  # local dev
+        _steer_captain_checkin,
+        _dispatch_captain_checkin,
+    )
 
 # ── lifecycle bindings (injected, NOT imported — see below) ───────────────────
 # monitors needs a handful of runtime functions and constants from lifecycle
@@ -150,9 +165,8 @@ def _schedule_monitor() -> None:
         # ── Interval sleep ───────────────────────────────────────────────────
         time.sleep(_SCHEDULE_MONITOR_INTERVAL)
         try:
-            with _registry_lock:
-                reg = _load_registry()
-                crew_items = list(reg["crews"].items())
+            with registry:
+                crew_items = list(registry._reg["crews"].items())
 
             now = time.time()
             for crew_id, info in crew_items:
@@ -177,14 +191,11 @@ def _schedule_monitor() -> None:
                         )
                         # Advance next_fire_at and persist
                         _advance_next_fire_at(sched)
-                        with _registry_lock:
-                            reg = _load_registry()
-                            crew_scheds = _get_crew_schedules(reg, crew_id)
-                            for s in crew_scheds:
+                        with registry:
+                            for s in registry.get_schedules(crew_id):
                                 if s.get("job_id") == sched.get("job_id"):
                                     s["next_fire_at"] = sched["next_fire_at"]
                                     break
-                            _save_registry(reg)
                         continue
 
                     # Check gateway enabled state — gateway is source of truth.
@@ -215,14 +226,11 @@ def _schedule_monitor() -> None:
                                 job_id,
                                 crew_id,
                             )
-                            with _registry_lock:
-                                reg = _load_registry()
-                                crew_scheds = _get_crew_schedules(reg, crew_id)
-                                for s in crew_scheds:
+                            with registry:
+                                for s in registry.get_schedules(crew_id):
                                     if s.get("job_id") == job_id:
                                         s["enabled"] = False
                                         break
-                                _save_registry(reg)
                             continue
                     except Exception as e:
                         logger.warning(
@@ -258,10 +266,8 @@ def _schedule_monitor() -> None:
                         # Advance next_fire_at in registry only on success
                         # Write last_checkin_at for captain check-ins
                         _advance_next_fire_at(sched)
-                        with _registry_lock:
-                            reg = _load_registry()
-                            crew_scheds = _get_crew_schedules(reg, crew_id)
-                            for s in crew_scheds:
+                        with registry:
+                            for s in registry.get_schedules(crew_id):
                                 if s.get("job_id") == sched.get("job_id"):
                                     s["next_fire_at"] = sched["next_fire_at"]
                                     if (
@@ -271,7 +277,6 @@ def _schedule_monitor() -> None:
                                         from datetime import datetime as _datetime, timezone as _tz
                                         s["last_checkin_at"] = _datetime.now(_tz.utc).isoformat()
                                     break
-                            _save_registry(reg)
 
                     # H-2: For one-shot (delay) jobs, disable the
                     # schedule in the registry FIRST (durable safety gate that
@@ -283,14 +288,12 @@ def _schedule_monitor() -> None:
                         if job_id:
                             # Step 1: mark disabled in registry (durable gate)
                             try:
-                                with _registry_lock:
-                                    _reg = _load_registry()
-                                    for _s in _get_crew_schedules(_reg, crew_id):
+                                with registry:
+                                    for _s in registry.get_schedules(crew_id):
                                         if _s.get("job_id") == job_id:
                                             _s["enabled"] = False
                                             _s["next_fire_at"] = _NEVER_FIRE_AT
                                             break
-                                    _save_registry(_reg)
                             except Exception as e:
                                 logger.warning(
                                     "Schedule monitor: could not disable one-shot cron %s in registry: %s",
@@ -400,9 +403,8 @@ def _idle_monitor() -> None:
             except Exception:
                 continue
 
-            with _registry_lock:
-                reg = _load_registry()
-                crew_items = list(reg["crews"].items())
+            with registry:
+                crew_items = list(registry._reg["crews"].items())
 
             now = time.time()
             for crew_id, info in crew_items:
@@ -438,11 +440,9 @@ def _idle_monitor() -> None:
                         new_cookie = _mint_cookie(podman, info["container"], crew_url)
                         if new_cookie:
                             cookie = f"mc_token_{CREW_GATEWAY_PORT}={new_cookie}"
-                            with _registry_lock:
-                                reg = _load_registry()
-                                if crew_id in reg["crews"]:
-                                    reg["crews"][crew_id]["cookie"] = new_cookie
-                                    _save_registry(reg)
+                            with registry:
+                                if crew_id in registry._reg["crews"]:
+                                    registry._reg["crews"][crew_id]["cookie"] = new_cookie
                             r = _http.get(
                                 f"{crew_url}/api/spawn",
                                 headers={"Cookie": cookie, "Origin": crew_url},
@@ -508,11 +508,9 @@ def _idle_monitor() -> None:
                         new_cookie = _mint_cookie(podman, info["container"], crew_url)
                         if new_cookie:
                             cookie = f"mc_token_{CREW_GATEWAY_PORT}={new_cookie}"
-                            with _registry_lock:
-                                reg = _load_registry()
-                                if crew_id in reg["crews"]:
-                                    reg["crews"][crew_id]["cookie"] = new_cookie
-                                    _save_registry(reg)
+                            with registry:
+                                if crew_id in registry._reg["crews"]:
+                                    registry._reg["crews"][crew_id]["cookie"] = new_cookie
                             r = _http.get(
                                 f"{crew_url}/api/crons",
                                 headers={"Cookie": cookie, "Origin": crew_url},
@@ -548,33 +546,48 @@ def _idle_monitor() -> None:
                     "Crew %s idle for %.0fs — stopping container",
                     crew_id, idle_secs,
                 )
-                # TOCTOU guard: re-read last_used from the live registry and
-                # perform the stop while the lock is held, so a _touch_crew
-                # call that lands between our HTTP checks and the stop cannot
-                # race us.  The design (D3) requires the re-check AND the stop
-                # to be atomic with respect to _touch_crew (which also acquires
-                # _registry_lock).  Holding the lock across container_stop adds
-                # latency bounded by Podman's stop timeout — acceptable per the
-                # design risk analysis.
+                # TRN-238 QA-1: do NOT hold _registry_lock across
+                # container_stop. The TOCTOU re-check (that no _touch_crew
+                # landed during the HTTP checks) and the double-stop guard are
+                # performed under the lock, but the lock is RELEASED before the
+                # potentially slow podman.container_stop call so a concurrent
+                # registry reader (e.g. crews(), a dispatch, or another monitor)
+                # is never blocked for the duration of a Podman stop timeout.
                 stop_failed = False
-                with _registry_lock:
-                    live_reg = _load_registry()
-                    live_last_used = live_reg.get("crews", {}).get(crew_id, {}).get("last_used", 0)
+                with registry:
+                    live_entry = registry._reg.get("crews", {}).get(crew_id, {})
+                    live_last_used = live_entry.get("last_used", 0)
                     if now - live_last_used < GA_IDLE_TIMEOUT_SECS:
                         _note_idle_skip(crew_id, "last_used advanced during checks — skipping stop")
                         continue
-                    try:
-                        podman.container_stop(info["container"])
-                    except Exception as e:
-                        # One crew's stop failure must not end idle reaping for every crew.
-                        logger.warning("Could not stop idle crew %s: %s", crew_id, e)
-                        stop_failed = True
-                    if not stop_failed:
-                        _idle_skip_reasons.pop(crew_id, None)
-                        reg = _load_registry()
-                        if crew_id in reg["crews"]:
-                            reg["crews"][crew_id]["status"] = "stopped"
-                            _save_registry(reg)
+                    # Double-stop guard: another idle tick already claimed this
+                    # crew and is mid-stop. Skip rather than issue a second
+                    # container_stop.
+                    if live_entry.get("_stopping"):
+                        _note_idle_skip(crew_id, "stop already in progress — skipping")
+                        continue
+                    # Claim the stop by marking the entry in-flight, then release
+                    # the lock. Persist so a concurrent reader observes the flag.
+                    if crew_id in registry._reg["crews"]:
+                        registry._reg["crews"][crew_id]["_stopping"] = True
+
+                # Lock released — perform the (potentially slow) stop WITHOUT it.
+                try:
+                    podman.container_stop(info["container"])
+                except Exception as e:
+                    # One crew's stop failure must not end idle reaping for every crew.
+                    logger.warning("Could not stop idle crew %s: %s", crew_id, e)
+                    stop_failed = True
+
+                # Re-acquire the lock to write back the result and clear the
+                # in-flight flag.
+                with registry:
+                    if crew_id in registry._reg["crews"]:
+                        registry._reg["crews"][crew_id].pop("_stopping", None)
+                        if not stop_failed:
+                            registry._reg["crews"][crew_id]["status"] = "stopped"
+                if not stop_failed:
+                    _idle_skip_reasons.pop(crew_id, None)
                 if stop_failed:
                     continue
         except Exception:
@@ -600,17 +613,15 @@ def _captain_monitor() -> None:
     registry; there is no gateway cron job for Captain.  This loop is the
     replacement for the gateway cron timer.
     """
-    # Import here to avoid circular import (same pattern as _schedule_monitor).
-    # These are injected via bind_lifecycle() for _crew_api_with_recovery and
-    # _ensure_crew_running.  For _steer_captain_checkin and
-    # _dispatch_captain_checkin we import from server at call time (they are
-    # defined there, not in lifecycle) to avoid a module-load cycle.
+    # _crew_api_with_recovery and _ensure_crew_running are injected via
+    # bind_lifecycle() — see the module-level comment above for why.
+    # _steer_captain_checkin and _dispatch_captain_checkin are top-level
+    # imports from captain_engine (TRN-242); no deferred import needed here.
     while True:
         next_wakeup = time.time() + _CAPTAIN_MONITOR_INTERVAL  # initialised before try so sleep line is always defined
         try:
-            with _registry_lock:
-                reg = _load_registry()
-                crew_items = list(reg["crews"].items())
+            with registry:
+                crew_items = list(registry._reg["crews"].items())
 
             now = time.time()
             next_wakeup = now + _CAPTAIN_MONITOR_INTERVAL
@@ -638,28 +649,59 @@ def _captain_monitor() -> None:
                             crew_id, e,
                         )
                         _advance_next_fire_at(sched)
-                        with _registry_lock:
-                            reg2 = _load_registry()
-                            for s in _get_crew_schedules(reg2, crew_id):
+                        with registry:
+                            for s in registry.get_schedules(crew_id):
                                 if s.get("type") == "captain":
                                     s["next_fire_at"] = sched["next_fire_at"]
                                     break
-                            _save_registry(reg2)
                         continue
 
-                    # Import _steer_captain_checkin from server at call time
-                    # to avoid a module-load cycle (server imports monitors).
+                    # ── Sentinel check (TRN-243) ─────────────────────────────
+                    # Before dispatching Raven, check whether the workspace
+                    # sentinel file exists.  If so, Raven has signalled
+                    # completion — pause the schedule and skip this tick.
                     try:
                         try:
-                            from server import (  # container: flat /app/
-                                _steer_captain_checkin,
-                                _dispatch_captain_checkin,
+                            from captain import (  # container
+                                _read_sentinel_file,
+                                _parse_sentinel_file,
                             )
                         except ModuleNotFoundError:
-                            from transport.server import (  # local dev  # type: ignore[no-redef]
-                                _steer_captain_checkin,
-                                _dispatch_captain_checkin,
+                            from transport.captain import (  # local dev  # type: ignore[no-redef]
+                                _read_sentinel_file,
+                                _parse_sentinel_file,
                             )
+                        try:
+                            from crew import Crew as _Crew  # container
+                        except ModuleNotFoundError:
+                            from transport.crew import Crew as _Crew  # local dev
+                        _c = _Crew.from_dict(crew_id, info)
+                        sentinel_content = _read_sentinel_file(_get_podman(), _c.container)
+                        if sentinel_content is not None:
+                            parsed = _parse_sentinel_file(sentinel_content)
+                            logger.info(
+                                "Captain monitor: sentinel file found for crew %s "
+                                "(captain_id=%s completed_at=%s) — auto-pausing schedule",
+                                crew_id,
+                                parsed.get("captain_id", "?"),
+                                parsed.get("completed_at", "?"),
+                            )
+                            with registry:
+                                for s in registry.get_schedules(crew_id):
+                                    if s.get("type") == "captain":
+                                        s["enabled"] = False
+                                        break
+                            continue
+                    except Exception as sentinel_exc:
+                        logger.warning(
+                            "Captain monitor: sentinel check failed for crew %s: %s",
+                            crew_id, sentinel_exc,
+                        )
+                    # ── end sentinel check ───────────────────────────────────
+
+                    # _steer_captain_checkin is imported at module top from
+                    # captain_engine (TRN-242) — no call-time import needed.
+                    try:
                         _steer_captain_checkin(crew, crew_id)
                     except Exception as e:
                         logger.error(
@@ -669,13 +711,11 @@ def _captain_monitor() -> None:
 
                     # Advance next_fire_at in registry
                     _advance_next_fire_at(sched)
-                    with _registry_lock:
-                        reg3 = _load_registry()
-                        for s in _get_crew_schedules(reg3, crew_id):
+                    with registry:
+                        for s in registry.get_schedules(crew_id):
                             if s.get("type") == "captain":
                                 s["next_fire_at"] = sched["next_fire_at"]
                                 break
-                        _save_registry(reg3)
 
         except Exception:
             logger.exception("Captain monitor iteration failed; retrying next interval")

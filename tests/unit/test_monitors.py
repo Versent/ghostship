@@ -1,1834 +1,840 @@
-"""Schedule and idle-monitor tests split from test_server.py (trn-119)."""
+"""Unit tests for transport/monitors.py (TRN-249).
+
+Covers:
+- _cron_activity_since: branch coverage of all active/inactive/edge cases
+- _cron_has_enabled_job: branch coverage of enabled/disabled/edge cases
+- _note_idle_skip: deduplication — logs once on first/changed reason, not on repeat
+- _schedule_monitor iteration: due/not-due, disabled, captain-skip, gateway-sync,
+  one-shot teardown, _ensure_crew_running failure, gateway fetch failure (fail-open)
+- _idle_monitor iteration: active tasks, cron hold, captain schedule hold, cookie
+  refresh, TOCTOU guard, _stopping flag lifecycle, skip conditions
+- _captain_monitor iteration: sentinel auto-pause, due/not-due, _ensure_crew_running
+  failure, skip on disabled
+
+All tests use FakePodmanClient — no unittest.mock.Mock() for Podman calls.
+bind_lifecycle() stubs are set in setUp for each test class.
+Registry state is provided by patching _load_registry to return controlled data.
+"""
+
 from __future__ import annotations
 
-import asyncio
-import base64
-import contextlib
-import hashlib
-import hmac
-import importlib as _importlib
-import inspect
-import json
-import os
-import re
-import shutil
-import stat
-import sys
-import tempfile
-import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, urlsplit
-from unittest.mock import ANY, Mock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-import httpx2 as httpx
-import transport.registry as _registry_mod  # noqa: F401
-
-from tests.unit.helpers import Request, server, lifecycle, monitors, academy  # noqa: F401
-# FakeHTTP / FakeResponse are consolidated in tests.unit.helpers.
-from tests.unit.helpers import FakeHTTP, FakeResponse  # noqa: F401
+import transport.monitors as monitors
+import transport.registry as _reg_mod
+from tests.fakes import FakePodmanClient
 
 
-# Backwards-compatible shim: this suite historically used
-# ``MockHTTPResponse(status_code, json_data)`` where the second positional is the
-# JSON body. The consolidated ``FakeResponse`` takes ``content`` in that slot, so
-# remap the positional json through the ``json_data`` keyword.
-def MockHTTPResponse(status_code: int = 200, json_data: Any = None) -> FakeResponse:
-    return FakeResponse(status_code=status_code, json_data=json_data)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _make_stub_lifecycle(**overrides):
+    """Return keyword args suitable for monitors.bind_lifecycle()."""
+    defaults = dict(
+        ga_idle_timeout_secs=300.0,
+        schedule_monitor_interval=30,
+        ensure_crew_running=MagicMock(return_value={"container": "gs-abc", "cookie": "tok"}),
+        crew_api=MagicMock(return_value={"jobs": []}),
+        crew_api_with_recovery=MagicMock(),
+        mint_cookie=MagicMock(return_value=None),
+    )
+    defaults.update(overrides)
+    return defaults
 
 
-class SetupPodman:
-    def __init__(self) -> None:
-        self.stops = 0
-        self.starts = 0
-
-    def container_stop(self, container: str) -> None:
-        self.stops += 1
-
-    def container_start(self, container: str) -> None:
-        self.starts += 1
-
-    def container_exec(
-        self,
-        container: str,
-        cmd: list[str],
-        env: dict[str, str] | None = None,
-    ) -> str:
-        return "ready"
-class IdleMonitorPodman:
-    """Mock PodmanClient for _idle_monitor tests."""
-
-    def __init__(
-        self,
-        containers_running: dict[str, bool] | None = None,
-    ) -> None:
-        self.containers_running = containers_running or {}
-        self.stops: list[str] = []
-
-    def container_is_running(self, name: str) -> bool:
-        return self.containers_running.get(name, True)
-
-    def container_stop(self, name: str) -> None:
-        self.stops.append(name)
+def _make_reg(crews: dict) -> dict:
+    """Build a registry dict with the given crews."""
+    return {"crews": crews}
 
 
-class IdleMonitorTests(unittest.TestCase):
-    """Tests for _idle_monitor logic (trn-17 tasks 4.x and 5.x)."""
+# ── Task 1.1: TestCronActivityHelpers ────────────────────────────────────────
 
-    def _run_one_iteration(
-        self,
-        crew_items: list[tuple[str, dict]],
-        podman: IdleMonitorPodman,
-        http_responses: list[MockHTTPResponse | BaseException] | None = None,
-        mint_cookie_return: str | None = None,
-    ) -> dict[str, Any]:
-        """Run a single iteration of the idle monitor and return state."""
-        # Use the consolidated FakeHTTP. It records requested URLs in
-        # ``.calls`` (the old inline closure recorded into ``http_calls``) and
-        # returns a 500 FakeResponse once the scripted list is exhausted, raising
-        # any BaseException entries — matching the previous behaviour exactly.
-        fake_http = FakeHTTP(list(http_responses or []), default=FakeResponse(500))
 
-        touched: list[str] = []
-        saved_regs: list[dict] = []
+class TestCronActivityHelpers(unittest.TestCase):
+    """_cron_activity_since: branch coverage."""
 
-        def touch(crew_id: str) -> None:
-            touched.append(crew_id)
+    def setUp(self):
+        self.last_used = 1000.0
 
-        def save_reg(reg: dict) -> None:
-            saved_regs.append(dict(reg))
+    def test_is_running_true_returns_true(self):
+        payload = {"jobs": [{"is_running": True}]}
+        self.assertTrue(monitors._cron_activity_since(payload, self.last_used))
 
-        # Patch the while loop to run once via StopIteration on sleep
-        sleep_called = [False]
+    def test_running_since_newer_than_last_used_returns_true(self):
+        payload = {"jobs": [{"is_running": False, "running_since": self.last_used + 10}]}
+        self.assertTrue(monitors._cron_activity_since(payload, self.last_used))
 
-        def fake_sleep(secs: float) -> None:
-            if sleep_called[0]:
-                raise StopIteration()
-            sleep_called[0] = True
+    def test_last_run_ts_newer_than_last_used_returns_true(self):
+        payload = {"jobs": [{"last_run_ts": self.last_used + 5}]}
+        self.assertTrue(monitors._cron_activity_since(payload, self.last_used))
 
-        with (
-            patch.object(monitors, "_get_podman", return_value=podman),
-            patch.object(monitors, "_http", fake_http),
-            patch.object(monitors, "_touch_crew", side_effect=touch),
-            patch.object(monitors, "_load_registry", return_value={"crews": dict(crew_items)}),
-            patch.object(monitors, "_save_registry", side_effect=save_reg),
-            patch.object(monitors, "_mint_cookie", return_value=mint_cookie_return),
-            patch.object(monitors.time, "sleep", side_effect=fake_sleep),
-            patch.object(monitors.time, "time", return_value=1000.0),
-        ):
+    def test_all_timestamps_older_not_running_returns_false(self):
+        payload = {"jobs": [{"is_running": False, "last_run_ts": self.last_used - 1, "running_since": self.last_used - 2}]}
+        self.assertFalse(monitors._cron_activity_since(payload, self.last_used))
+
+    def test_empty_jobs_list_returns_false(self):
+        payload = {"jobs": []}
+        self.assertFalse(monitors._cron_activity_since(payload, self.last_used))
+
+    def test_non_dict_payload_returns_false(self):
+        self.assertFalse(monitors._cron_activity_since("not-a-dict", self.last_used))
+        self.assertFalse(monitors._cron_activity_since(None, self.last_used))
+        self.assertFalse(monitors._cron_activity_since([], self.last_used))
+
+    def test_non_dict_job_entry_skipped(self):
+        payload = {"jobs": ["not-a-dict", None, 42]}
+        self.assertFalse(monitors._cron_activity_since(payload, self.last_used))
+
+    def test_bool_timestamps_ignored(self):
+        """bool is a subclass of int/float — must not be treated as a timestamp."""
+        payload = {"jobs": [{"last_run_ts": True}]}
+        self.assertFalse(monitors._cron_activity_since(payload, self.last_used))
+
+
+# ── Task 1.2: TestCronHasEnabledJob ──────────────────────────────────────────
+
+
+class TestCronHasEnabledJob(unittest.TestCase):
+    """_cron_has_enabled_job: branch coverage."""
+
+    def test_at_least_one_enabled_returns_true(self):
+        payload = {"jobs": [{"enabled": True}]}
+        self.assertTrue(monitors._cron_has_enabled_job(payload))
+
+    def test_all_disabled_returns_false(self):
+        payload = {"jobs": [{"enabled": False}, {"enabled": False}]}
+        self.assertFalse(monitors._cron_has_enabled_job(payload))
+
+    def test_enabled_missing_returns_false(self):
+        payload = {"jobs": [{"name": "job1"}]}
+        self.assertFalse(monitors._cron_has_enabled_job(payload))
+
+    def test_empty_list_returns_false(self):
+        payload = {"jobs": []}
+        self.assertFalse(monitors._cron_has_enabled_job(payload))
+
+    def test_non_dict_payload_returns_false(self):
+        self.assertFalse(monitors._cron_has_enabled_job("not-a-dict"))
+        self.assertFalse(monitors._cron_has_enabled_job(None))
+        self.assertFalse(monitors._cron_has_enabled_job([]))
+
+    def test_non_dict_job_entry_skipped(self):
+        payload = {"jobs": ["not-a-dict", {"enabled": True}]}
+        self.assertTrue(monitors._cron_has_enabled_job(payload))
+
+    def test_mixed_enabled_returns_true(self):
+        payload = {"jobs": [{"enabled": False}, {"enabled": True}]}
+        self.assertTrue(monitors._cron_has_enabled_job(payload))
+
+
+# ── Task 2.1: TestNoteIdleSkip ────────────────────────────────────────────────
+
+
+class TestNoteIdleSkip(unittest.TestCase):
+    """_note_idle_skip: deduplication of idle-skip log messages."""
+
+    def setUp(self):
+        monitors._idle_skip_reasons.clear()
+
+    def tearDown(self):
+        monitors._idle_skip_reasons.clear()
+
+    def test_first_call_logs_at_info(self):
+        with self.assertLogs("transport.lifecycle", level="INFO") as cm:
+            monitors._note_idle_skip("crew-1", "tasks running")
+        self.assertTrue(any("crew-1" in line and "tasks running" in line for line in cm.output))
+
+    def test_second_call_same_reason_no_log(self):
+        # First call must log
+        monitors._note_idle_skip("crew-1", "tasks running")
+        # Capture any new logs during the second call — none should appear.
+        # We verify by checking _idle_skip_reasons is set correctly and
+        # rely on the fact that assertLogs raises if nothing is logged.
+        with self.assertRaises(AssertionError):
+            with self.assertLogs("transport.lifecycle", level="INFO"):
+                monitors._note_idle_skip("crew-1", "tasks running")
+
+    def test_second_call_different_reason_logs(self):
+        monitors._note_idle_skip("crew-1", "tasks running")
+        with self.assertLogs("transport.lifecycle", level="INFO") as cm:
+            monitors._note_idle_skip("crew-1", "cron job enabled or recently ran")
+        self.assertTrue(any("crew-1" in line for line in cm.output))
+
+    def test_different_crew_always_logs(self):
+        monitors._note_idle_skip("crew-1", "tasks running")
+        with self.assertLogs("transport.lifecycle", level="INFO") as cm:
+            monitors._note_idle_skip("crew-2", "tasks running")
+        self.assertTrue(any("crew-2" in line for line in cm.output))
+
+
+# ── Task 3.x: TestScheduleMonitorIteration ───────────────────────────────────
+
+
+class TestScheduleMonitorIteration(unittest.TestCase):
+    """_schedule_monitor iteration: single-tick body logic."""
+
+    CREW_ID = "crew-abc"
+    CONTAINER = "gs-crew-abc"
+    NOW = 5000.0
+
+    def _make_crew_entry(self, schedules=None, **kwargs):
+        entry = {
+            "container": self.CONTAINER,
+            "cookie": "tok",
+            "status": "running",
+            "last_used": self.NOW - 400,
+        }
+        entry.update(kwargs)
+        if schedules is not None:
+            entry["schedules"] = schedules
+        return entry
+
+    def _make_sched(self, **kwargs):
+        base = {
+            "job_id": "job-1",
+            "enabled": True,
+            "next_fire_at": self.NOW - 10,
+            "interval_secs": 60,
+            "message": "tick",
+            "agent": "ghost",
+        }
+        base.update(kwargs)
+        return base
+
+    def setUp(self):
+        stubs = _make_stub_lifecycle()
+        self._ensure = stubs["ensure_crew_running"]
+        self._crew_api = stubs["crew_api"]
+        self._crew_api_with_recovery = stubs["crew_api_with_recovery"]
+        monitors.bind_lifecycle(**stubs)
+
+    def tearDown(self):
+        monitors._idle_skip_reasons.clear()
+
+    def _run_one_tick(self, crews):
+        """Run exactly one schedule-monitor body iteration.
+
+        _schedule_monitor sleeps at the TOP of its while loop before running the
+        body. We must let the first sleep return normally (the interval wait) and
+        only raise StopIteration on the second sleep (the next interval) so the
+        body between them executes exactly once.
+
+        Patches:
+        - time.sleep: returns None on call 1, raises StopIteration on call 2
+        - time.time:  returns self.NOW
+        - _load_registry: returns our scripted registry
+        - _save_registry: no-op
+        """
+        reg = _make_reg(crews)
+
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
             try:
-                server._idle_monitor()
+                monitors._schedule_monitor()
             except StopIteration:
                 pass
 
-        return {
-            "stops": podman.stops,
-            "touched": touched,
-            "http_calls": fake_http.calls,
-            "saved_regs": saved_regs,
-        }
+    def test_due_job_calls_crew_api_with_recovery_post(self):
+        """Due job → _crew_api_with_recovery called with POST /api/spawn."""
+        sched = self._make_sched()
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._crew_api_with_recovery.assert_called()
+        # Verify it was POST /api/spawn
+        found_post = any(
+            "POST" in str(c) and "/api/spawn" in str(c)
+            for c in self._crew_api_with_recovery.call_args_list
+        )
+        self.assertTrue(found_post)
 
-    def test_crew_with_active_task_not_stopped(self) -> None:
-        """4.1: crew with active dispatch task is not stopped, last_used updated."""
-        podman = IdleMonitorPodman(containers_running={"gs-active": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": [{"done": False}]})
-        crew_items = [("active", {"container": "gs-active", "status": "running", "cookie": "c", "last_used": 0})]
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp])
-
-        self.assertEqual(result["stops"], [])
-        self.assertIn("active", result["touched"])
-
-    def test_crew_with_enabled_cron_not_stopped(self) -> None:
-        """4.2: crew with enabled cron job is not stopped, last_used updated."""
-        podman = IdleMonitorPodman(containers_running={"gs-cron": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_resp = MockHTTPResponse(200, {"jobs": [{"name": "check", "enabled": True}]})
-        crew_items = [("cron-crew", {"container": "gs-cron", "status": "running", "cookie": "c", "last_used": 0})]
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp, cron_resp])
-
-        self.assertEqual(result["stops"], [])
-        self.assertIn("cron-crew", result["touched"])
-
-    def test_genuinely_idle_crew_is_stopped(self) -> None:
-        """4.3: genuinely idle crew is stopped, registry marked 'stopped'."""
-        podman = IdleMonitorPodman(containers_running={"gs-idle": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_resp = MockHTTPResponse(200, {"jobs": []})
-        crew_items = [("idle-crew", {"container": "gs-idle", "status": "running", "cookie": "c", "last_used": 0})]
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp, cron_resp])
-
-        self.assertIn("gs-idle", result["stops"])
-        self.assertTrue(result["saved_regs"])
-        self.assertEqual(result["saved_regs"][-1]["crews"]["idle-crew"]["status"], "stopped")
-
-    def test_touched_during_http_checks_skips_stop(self) -> None:
-        """3.3 (D3): a crew whose last_used advances during the HTTP activity
-        checks must NOT be stopped. The reaper re-reads last_used from the live
-        registry under the lock right before the stop and skips when it is now
-        within GA_IDLE_TIMEOUT_SECS.
-
-        The snapshot the reaper iterates shows the crew idle (last_used=0), but
-        a dispatch landing during the ~multi-second HTTP checks advances
-        last_used to 'now' in the live registry. The re-read must observe that
-        and skip the stop.
-        """
-        podman = IdleMonitorPodman(containers_running={"gs-raced": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_resp = MockHTTPResponse(200, {"jobs": []})
-        fake_http = FakeHTTP([spawn_resp, cron_resp], default=FakeResponse(500))
-
-        # The idle snapshot (first _load_registry) shows last_used=0 → idle.
-        idle_snapshot = {"crews": {"raced": {
-            "container": "gs-raced", "status": "running", "cookie": "c", "last_used": 0,
-        }}}
-        # Every subsequent _load_registry (the TOCTOU re-read, and the
-        # post-stop write path) sees last_used advanced to 'now' — a dispatch
-        # that landed during the HTTP checks.
-        touched_registry = {"crews": {"raced": {
-            "container": "gs-raced", "status": "running", "cookie": "c", "last_used": 1000.0,
-        }}}
-        load_calls = [0]
-
-        def load_side_effect():
-            load_calls[0] += 1
-            # First call = the iteration snapshot (idle); all later calls =
-            # the live re-read showing the crew was just touched.
-            return idle_snapshot if load_calls[0] == 1 else touched_registry
-
-        sleep_called = [False]
-
-        def fake_sleep(secs):
-            if sleep_called[0]:
-                raise StopIteration()
-            sleep_called[0] = True
-
-        saved_regs: list[dict] = []
-        with (
-            patch.object(monitors, "_get_podman", return_value=podman),
-            patch.object(monitors, "_http", fake_http),
-            patch.object(monitors, "_touch_crew"),
-            patch.object(monitors, "_load_registry", side_effect=load_side_effect),
-            patch.object(monitors, "_save_registry", side_effect=lambda r: saved_regs.append(dict(r))),
-            patch.object(monitors, "_mint_cookie", return_value=None),
-            patch.object(monitors, "GA_IDLE_TIMEOUT_SECS", 300.0),
-            patch.object(monitors.time, "sleep", side_effect=fake_sleep),
-            patch.object(monitors.time, "time", return_value=1000.0),
-        ):
+    def test_due_job_advances_next_fire_at(self):
+        """Due job that fires → next_fire_at advances beyond now."""
+        sched = self._make_sched()
+        old_nfa = sched["next_fire_at"]
+        reg = _make_reg({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
             try:
-                server._idle_monitor()
+                monitors._schedule_monitor()
+            except StopIteration:
+                pass
+        # _advance_next_fire_at mutates the sched in the reg dict
+        live_scheds = reg["crews"][self.CREW_ID].get("schedules", [])
+        live_sched = next((s for s in live_scheds if s.get("job_id") == "job-1"), sched)
+        self.assertGreater(live_sched["next_fire_at"], old_nfa)
+
+    def test_not_yet_due_job_not_fired(self):
+        """next_fire_at in future → _crew_api_with_recovery not called."""
+        sched = self._make_sched(next_fire_at=self.NOW + 9999)
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._crew_api_with_recovery.assert_not_called()
+
+    def test_disabled_job_skipped(self):
+        """enabled=False → _crew_api_with_recovery not called."""
+        sched = self._make_sched(enabled=False)
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._crew_api_with_recovery.assert_not_called()
+
+    def test_captain_type_job_skipped(self):
+        """type==captain → _crew_api_with_recovery not called."""
+        sched = self._make_sched(type="captain")
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._crew_api_with_recovery.assert_not_called()
+
+    def test_ensure_crew_running_raises_advances_next_fire_at(self):
+        """_ensure_crew_running raises → next_fire_at advanced, no spawn call."""
+        self._ensure.side_effect = RuntimeError("container dead")
+        sched = self._make_sched()
+        old_nfa = sched["next_fire_at"]
+        reg = _make_reg({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
+            try:
+                monitors._schedule_monitor()
+            except StopIteration:
+                pass
+        self._crew_api_with_recovery.assert_not_called()
+        live_scheds = reg["crews"][self.CREW_ID].get("schedules", [])
+        live_sched = next((s for s in live_scheds if s.get("job_id") == "job-1"), sched)
+        self.assertGreater(live_sched["next_fire_at"], old_nfa)
+
+    def test_gateway_disabled_job_sets_registry_disabled(self):
+        """Gateway returns job with enabled=false → registry entry disabled, no spawn."""
+        self._crew_api.return_value = {"jobs": [{"id": "job-1", "enabled": False}]}
+        sched = self._make_sched(job_id="job-1")
+        reg = _make_reg({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+
+        # We need _load_registry to return the same reg object so mutations land
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
+            try:
+                monitors._schedule_monitor()
             except StopIteration:
                 pass
 
-        # The re-check saw last_used == now (within the 300s timeout) → no stop,
-        # and no "stopped" status write for this crew.
-        self.assertEqual(podman.stops, [])
-        self.assertFalse(
-            any("raced" in r.get("crews", {})
-                and r["crews"]["raced"].get("status") == "stopped"
-                for r in saved_regs),
-            f"crew was stopped despite being touched during checks: {saved_regs}",
-        )
+        self._crew_api_with_recovery.assert_not_called()
+        crew_scheds = reg["crews"][self.CREW_ID].get("schedules", [])
+        disabled = [s for s in crew_scheds if s.get("job_id") == "job-1" and not s.get("enabled", True)]
+        self.assertTrue(len(disabled) >= 1)
 
-    def test_stop_is_atomic_with_recheck_under_lock(self) -> None:
-        """3.2 (D3): the container_stop call must happen while _registry_lock is
-        held, so a concurrent _touch_crew (which also acquires the same lock) cannot
-        slip between the re-check and the stop.
+    def test_gateway_fetch_raises_fail_open_spawns(self):
+        """Gateway fetch raises → fail-open, spawn still called."""
+        self._crew_api.side_effect = RuntimeError("gateway unreachable")
+        sched = self._make_sched()
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._crew_api_with_recovery.assert_called()
 
-        The test verifies that when container_stop is invoked the registry lock is
-        already held: we replace _registry_lock with a real threading.Lock, then
-        record inside container_stop whether the lock is currently held by checking
-        lock.locked(). If the stop is outside the lock, locked() returns False.
-        """
-        podman = IdleMonitorPodman(containers_running={"gs-atomic": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_resp = MockHTTPResponse(200, {"jobs": []})
-        fake_http = FakeHTTP([spawn_resp, cron_resp], default=FakeResponse(500))
+    def test_one_shot_job_sets_registry_disabled_and_never_fire_at(self):
+        """one_shot=True job fires → registry entry enabled=False, next_fire_at=_NEVER_FIRE_AT."""
+        sched = self._make_sched(one_shot=True, job_id="oneshot-1")
+        reg = _make_reg({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
 
-        idle_snapshot = {"crews": {"atomic": {
-            "container": "gs-atomic", "status": "running", "cookie": "c", "last_used": 0,
-        }}}
-        # The re-read (inside the lock) shows the crew is still idle — stop proceeds.
-        still_idle_registry = {"crews": {"atomic": {
-            "container": "gs-atomic", "status": "running", "cookie": "c", "last_used": 0,
-        }}}
-        load_calls = [0]
-
-        def load_side_effect():
-            load_calls[0] += 1
-            return idle_snapshot if load_calls[0] == 1 else still_idle_registry
-
-        # Use a real lock so we can inspect its state inside container_stop.
-        real_lock = threading.Lock()
-        lock_held_during_stop = [None]  # True/False/None
-
-        class _AtomicPodman:
-            stops: list[str] = []
-
-            def container_is_running(self, name: str) -> bool:
-                return True
-
-            def container_stop(self, name: str) -> None:
-                # Record whether _registry_lock is held at the moment of the stop.
-                lock_held_during_stop[0] = real_lock.locked()
-                self.stops.append(name)
-
-        atomic_podman = _AtomicPodman()
-        sleep_called = [False]
-
-        def fake_sleep(secs):
-            if sleep_called[0]:
-                raise StopIteration()
-            sleep_called[0] = True
-
-        with (
-            patch.object(monitors, "_get_podman", return_value=atomic_podman),
-            patch.object(monitors, "_http", fake_http),
-            patch.object(monitors, "_touch_crew"),
-            patch.object(monitors, "_load_registry", side_effect=load_side_effect),
-            patch.object(monitors, "_save_registry"),
-            patch.object(monitors, "_mint_cookie", return_value=None),
-            patch.object(monitors, "_registry_lock", real_lock),
-            patch.object(monitors, "GA_IDLE_TIMEOUT_SECS", 300.0),
-            patch.object(monitors.time, "sleep", side_effect=fake_sleep),
-            patch.object(monitors.time, "time", return_value=1000.0),
-        ):
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
             try:
-                server._idle_monitor()
+                monitors._schedule_monitor()
             except StopIteration:
                 pass
 
-        # The stop should have happened (crew was genuinely idle).
-        self.assertIn("gs-atomic", atomic_podman.stops,
-                      "expected the idle crew to be stopped")
-        # The decisive assertion: the lock must have been held when stop ran.
-        self.assertTrue(
-            lock_held_during_stop[0],
-            "container_stop was called OUTSIDE _registry_lock — the re-check and "
-            "stop are not atomic; a concurrent _touch_crew can slip between them "
-            "(task 3.2 / D3 design requirement)",
-        )
+        crew_scheds = reg["crews"][self.CREW_ID].get("schedules", [])
+        oneshot = next((s for s in crew_scheds if s.get("job_id") == "oneshot-1"), None)
+        self.assertIsNotNone(oneshot)
+        self.assertFalse(oneshot.get("enabled", True))
+        self.assertEqual(oneshot.get("next_fire_at"), _reg_mod._NEVER_FIRE_AT)
 
-    def test_recently_used_crew_skipped(self) -> None:
-        """4.4: recently used crew (within timeout) is skipped."""
-        podman = IdleMonitorPodman(containers_running={"gs-recent": True})
-        # last_used is recent enough (within GA_IDLE_TIMEOUT_SECS of now=1000)
-        crew_items = [("recent", {"container": "gs-recent", "status": "running", "cookie": "c", "last_used": 999.0})]
-        result = self._run_one_iteration(crew_items, podman, [])
+    def test_one_shot_job_calls_delete_on_gateway(self):
+        """one_shot=True job fires → _crew_api_with_recovery called with DELETE /api/crons/<id>."""
+        sched = self._make_sched(one_shot=True, job_id="oneshot-1")
+        reg = _make_reg({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
 
-        self.assertEqual(result["stops"], [])
-        self.assertEqual(result["touched"], [])
-        self.assertEqual(result["http_calls"], [])
-
-    def test_already_stopped_container_skipped(self) -> None:
-        """4.5: already-stopped container is skipped (no double-stop)."""
-        podman = IdleMonitorPodman(containers_running={"gs-stopped": False})
-        crew_items = [("stopped", {"container": "gs-stopped", "status": "running", "cookie": "c", "last_used": 0})]
-        result = self._run_one_iteration(crew_items, podman, [])
-
-        self.assertEqual(result["stops"], [])
-
-    def test_401_triggers_cookie_refresh_and_retry(self) -> None:
-        """5.2: 401 response triggers cookie refresh and successful retry."""
-        podman = IdleMonitorPodman(containers_running={"gs-auth": True})
-        # First spawn call returns 401, retry returns 200 with active task
-        spawn_401 = MockHTTPResponse(401)
-        spawn_ok = MockHTTPResponse(200, {"agents": [{"done": False}]})
-        crew_items = [("auth-crew", {"container": "gs-auth", "status": "running", "cookie": "old", "last_used": 0})]
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_401, spawn_ok],
-            mint_cookie_return="new-cookie",
-        )
-
-        self.assertEqual(result["stops"], [])
-        self.assertIn("auth-crew", result["touched"])
-
-    def test_401_with_failed_cookie_refresh_skips_crew(self) -> None:
-        """5.3: 401 with failed cookie refresh skips crew (does not stop it)."""
-        podman = IdleMonitorPodman(containers_running={"gs-nauth": True})
-        spawn_401 = MockHTTPResponse(401)
-        crew_items = [("nauth-crew", {"container": "gs-nauth", "status": "running", "cookie": "dead", "last_used": 0})]
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_401],
-            mint_cookie_return=None,  # cookie refresh fails
-        )
-
-        # Should NOT stop the crew (fail-open)
-        self.assertEqual(result["stops"], [])
-        # Should NOT touch (we can't verify activity)
-        self.assertEqual(result["touched"], [])
-
-    def test_spawn_activity_check_exception_skips_crew(self) -> None:
-        """An /api/spawn error leaves the crew running for this cycle."""
-        podman = IdleMonitorPodman(containers_running={"gs-spawn-error": True})
-        crew_items = [(
-            "spawn-error",
-            {"container": "gs-spawn-error", "status": "running", "cookie": "c", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [RuntimeError("spawn unavailable")]
-        )
-
-        self.assertEqual(result["stops"], [])
-
-    def test_spawn_activity_check_unexpected_response_skips_crew(self) -> None:
-        """A non-success /api/spawn response leaves the crew running."""
-        podman = IdleMonitorPodman(containers_running={"gs-spawn-status-error": True})
-        crew_items = [(
-            "spawn-status-error",
-            {"container": "gs-spawn-status-error", "status": "running", "cookie": "c", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [MockHTTPResponse(503)]
-        )
-
-        self.assertEqual(result["stops"], [])
-
-    def test_spawn_activity_check_malformed_response_skips_crew(self) -> None:
-        """A malformed successful /api/spawn payload leaves the crew running."""
-        podman = IdleMonitorPodman(containers_running={"gs-spawn-malformed": True})
-        crew_items = [(
-            "spawn-malformed",
-            {"container": "gs-spawn-malformed", "status": "running", "cookie": "c", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [MockHTTPResponse(200, [])]
-        )
-
-        self.assertEqual(result["stops"], [])
-
-    def test_cron_activity_check_exception_skips_crew(self) -> None:
-        """An /api/crons error leaves the crew running for this cycle."""
-        podman = IdleMonitorPodman(containers_running={"gs-cron-error": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        crew_items = [(
-            "cron-error",
-            {"container": "gs-cron-error", "status": "running", "cookie": "c", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_resp, RuntimeError("crons unavailable")]
-        )
-
-        self.assertEqual(result["stops"], [])
-
-    def test_cron_activity_check_unexpected_response_skips_crew(self) -> None:
-        """A non-success /api/crons response leaves the crew running."""
-        podman = IdleMonitorPodman(containers_running={"gs-cron-status-error": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        crew_items = [(
-            "cron-status-error",
-            {"container": "gs-cron-status-error", "status": "running", "cookie": "c", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_resp, MockHTTPResponse(503)]
-        )
-
-        self.assertEqual(result["stops"], [])
-
-    def test_cron_activity_check_malformed_response_skips_crew(self) -> None:
-        """A malformed successful /api/crons payload leaves the crew running."""
-        podman = IdleMonitorPodman(containers_running={"gs-cron-malformed": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        crew_items = [(
-            "cron-malformed",
-            {"container": "gs-cron-malformed", "status": "running", "cookie": "c", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_resp, MockHTTPResponse(200, [])]
-        )
-
-        self.assertEqual(result["stops"], [])
-
-    def test_idle_monitor_cron_401_retries_with_fresh_cookie(self) -> None:
-        """D9 — cron endpoint 401 triggers cookie refresh and retry."""
-        podman = IdleMonitorPodman(containers_running={"gs-cron401": True})
-        # spawn returns empty (no tasks), cron first returns 401, then (after cookie refresh)
-        # returns a listing with an enabled cron job (keeps crew alive).
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_401 = MockHTTPResponse(401)
-        cron_ok = MockHTTPResponse(200, {"jobs": [{"name": "check", "enabled": True}]})
-        crew_items = [(
-            "cron401-crew",
-            {"container": "gs-cron401", "status": "running", "cookie": "old", "last_used": 0},
-        )]
-
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_resp, cron_401, cron_ok],
-            mint_cookie_return="new-cookie",
-        )
-
-        # Cookie refresh happened, cron retried — crew should NOT be stopped
-        self.assertEqual(result["stops"], [], "crew should not be stopped after cron 401 retry")
-        self.assertIn("cron401-crew", result["touched"])
-
-    def test_403_triggers_cookie_refresh_and_retry_on_spawn(self) -> None:
-        """2.2 (trn-78): 403 response on spawn triggers cookie refresh and retry."""
-        podman = IdleMonitorPodman(containers_running={"gs-403spawn": True})
-        # First spawn call returns 403 (CSRF mismatch), retry returns 200 with active task
-        spawn_403 = MockHTTPResponse(403)
-        spawn_ok = MockHTTPResponse(200, {"agents": [{"done": False}]})
-        crew_items = [("spawn-403-crew", {
-            "container": "gs-403spawn", "status": "running", "cookie": "old", "last_used": 0,
-        })]
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_403, spawn_ok],
-            mint_cookie_return="new-cookie",
-        )
-
-        # Crew has active task after retry — must not be stopped
-        self.assertEqual(result["stops"], [])
-        self.assertIn("spawn-403-crew", result["touched"])
-
-    def test_403_with_successful_cookie_refresh_stops_idle_crew(self) -> None:
-        """2.3 (trn-78): idle monitor stops crew after successful cookie refresh following 403."""
-        podman = IdleMonitorPodman(containers_running={"gs-403idle": True})
-        # spawn: first 403, then (after cookie refresh) 200 with empty agents
-        # crons: 200 with empty jobs list → crew is genuinely idle → gets stopped
-        spawn_403 = MockHTTPResponse(403)
-        spawn_ok = MockHTTPResponse(200, {"agents": []})
-        cron_ok = MockHTTPResponse(200, {"jobs": []})
-        crew_items = [("idle-403-crew", {
-            "container": "gs-403idle", "status": "running", "cookie": "old", "last_used": 0,
-        })]
-        result = self._run_one_iteration(
-            crew_items, podman, [spawn_403, spawn_ok, cron_ok],
-            mint_cookie_return="new-cookie",
-        )
-
-        # Cookie refresh succeeded, no active tasks — crew should be stopped
-        self.assertIn("gs-403idle", result["stops"])
-        self.assertTrue(result["saved_regs"])
-        self.assertEqual(result["saved_regs"][-1]["crews"]["idle-403-crew"]["status"], "stopped")
-
-    # ── TRN-228: captain schedule hold tests ──────────────────────────────────
-
-    def test_crew_with_enabled_captain_schedule_not_stopped(self) -> None:
-        """TRN-228 (2.1): crew with enabled captain schedule and next_fire_at in
-        the future must NOT be idle-stopped; _touch_crew is called."""
-        podman = IdleMonitorPodman(containers_running={"gs-captain": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        crew_items = [("captain-crew", {
-            "container": "gs-captain", "status": "running", "cookie": "c", "last_used": 0,
-            "schedules": [{"type": "captain", "enabled": True, "next_fire_at": 1300.0}],
-        })]
-        # Only spawn check should fire — the captain check short-circuits before /api/crons
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp])
-
-        self.assertNotIn("gs-captain", result["stops"])
-        self.assertIn("captain-crew", result["touched"])
-
-    def test_crew_with_disabled_captain_schedule_can_be_stopped(self) -> None:
-        """TRN-228 (2.2): disabled captain schedule must NOT block idle-stop."""
-        podman = IdleMonitorPodman(containers_running={"gs-captoff": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_resp = MockHTTPResponse(200, {"jobs": []})
-        crew_items = [("captain-off", {
-            "container": "gs-captoff", "status": "running", "cookie": "c", "last_used": 0,
-            "schedules": [{"type": "captain", "enabled": False, "next_fire_at": 1300.0}],
-        })]
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp, cron_resp])
-
-        self.assertIn("gs-captoff", result["stops"])
-
-    def test_crew_with_captain_schedule_at_never_fire_can_be_stopped(self) -> None:
-        """TRN-228 (2.3): captain schedule with next_fire_at == _NEVER_FIRE_AT
-        (9_999_999_999.0) must NOT block idle-stop — it has already fired or
-        been paused."""
-        podman = IdleMonitorPodman(containers_running={"gs-captnever": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": []})
-        cron_resp = MockHTTPResponse(200, {"jobs": []})
-        crew_items = [("captain-never", {
-            "container": "gs-captnever", "status": "running", "cookie": "c", "last_used": 0,
-            "schedules": [{"type": "captain", "enabled": True, "next_fire_at": 9_999_999_999.0}],
-        })]
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp, cron_resp])
-
-        self.assertIn("gs-captnever", result["stops"])
-
-    def test_crew_with_captain_schedule_and_active_task_not_stopped(self) -> None:
-        """TRN-228 (2.4): both hold conditions are independent — active spawn task
-        alone prevents stop; captain schedule alone prevents stop; both together
-        still prevent stop."""
-        podman = IdleMonitorPodman(containers_running={"gs-captboth": True})
-        spawn_resp = MockHTTPResponse(200, {"agents": [{"done": False}]})
-        crew_items = [("captain-both", {
-            "container": "gs-captboth", "status": "running", "cookie": "c", "last_used": 0,
-            "schedules": [{"type": "captain", "enabled": True, "next_fire_at": 1300.0}],
-        })]
-        result = self._run_one_iteration(crew_items, podman, [spawn_resp])
-
-        self.assertNotIn("gs-captboth", result["stops"])
-
-
-class IdleMonitorActivityTests(unittest.TestCase):
-    def test_cron_activity_counts_running_and_recent_completed_runs(self) -> None:
-        self.assertTrue(
-            server._cron_activity_since(
-                {"jobs": [{"is_running": True, "running_since": 90}]}, 100
-            )
-        )
-        self.assertTrue(
-            server._cron_activity_since(
-                {"jobs": [{"is_running": False, "last_run_ts": 101}]}, 100
-            )
-        )
-        self.assertFalse(
-            server._cron_activity_since(
-                {"jobs": [{"is_running": False, "last_run_ts": 100}]}, 100
-            )
-        )
-
-    def test_enabled_job_with_no_activity_history_still_counts(self) -> None:
-        # A freshly-created job with interval longer than GA_IDLE_TIMEOUT_SECS
-        # has no is_running/running_since/last_run_ts yet — _cron_activity_since
-        # alone would report no activity, and the crew would idle-stop before
-        # the job's very first fire. _cron_has_enabled_job is the separate
-        # signal that catches this: an enabled job is a standing commitment to
-        # run, regardless of whether it has run yet.
-        fresh_job_payload = {"jobs": [{"name": "captain", "agent": "raven", "enabled": True}]}
-        self.assertFalse(server._cron_activity_since(fresh_job_payload, 100))
-        self.assertTrue(server._cron_has_enabled_job(fresh_job_payload))
-
-    def test_disabled_job_does_not_count_as_enabled(self) -> None:
-        self.assertFalse(
-            server._cron_has_enabled_job({"jobs": [{"name": "captain", "enabled": False}]})
-        )
-        self.assertFalse(server._cron_has_enabled_job({"jobs": []}))
-        self.assertFalse(server._cron_has_enabled_job({}))
-class ScheduleMonitorTests(unittest.TestCase):
-    """Tests for _schedule_monitor."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie", "status": "running"}
-
-    def test_monitor_wakes_crew_and_fires_tick(self) -> None:
-        """7.4 — _schedule_monitor calls the real function; tick is fired after one loop."""
-        now = time.time()
-        reg = {"crews": {"demo": {
-            "container": "gs-demo", "cookie": "cookie", "status": "stopped",
-            "schedules": [{
-                "job_id": "j1", "name": "check", "interval_secs": 300, "cron_expr": None,
-                "next_fire_at": now - 10,  # due
-                "agent": "ghost", "message": "do check", "model": "claude-sonnet-5",
-                "enabled": True,
-            }],
-        }}}
-        api_calls = []
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            api_calls.append((method, path, kwargs))
-            return {"id": "spawn-1"}
-
-        save_calls = []
-
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        # Use StopIteration on the second time.sleep call to exit the while True loop
-        # after exactly one iteration.  The monitor sleeps FIRST, then does work, then
-        # loops back to sleep — raising on the second sleep gives the work one full pass.
-        sleep_count = [0]
-
-        def fake_sleep(secs: float) -> None:
-            sleep_count[0] += 1
-            if sleep_count[0] >= 2:
-                raise StopIteration("break after one iteration")
-
-        with (
-            patch.object(monitors, "_load_registry", return_value=reg),
-            patch.object(monitors, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(monitors, "_crew_api_with_recovery", side_effect=api),
-            patch.object(monitors, "_save_registry", side_effect=fake_save),
-            patch.object(monitors, "_get_crew_schedules", return_value=reg["crews"]["demo"]["schedules"]),
-            patch.object(monitors.time, "sleep", side_effect=fake_sleep),
-        ):
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
             try:
-                server._schedule_monitor()
+                monitors._schedule_monitor()
             except StopIteration:
-                pass  # expected — one iteration complete
+                pass
 
-        # Verify the spawn POST was fired
-        self.assertTrue(
-            any(m == "POST" and "/api/spawn" in p for m, p, _ in api_calls),
-            f"Expected a POST /api/spawn call; got: {api_calls}",
-        )
-        # Verify registry was saved after the tick
-        self.assertTrue(len(save_calls) > 0, "Expected _save_registry to have been called")
-        spawn_calls = [
-            kwargs for method, path, kwargs in api_calls
-            if method == "POST" and path == "/api/spawn"
+        delete_calls = [
+            c for c in self._crew_api_with_recovery.call_args_list
+            if "DELETE" in c.args
         ]
-        self.assertEqual(spawn_calls[0]["json"]["model"], "claude-sonnet-5")
+        self.assertTrue(len(delete_calls) >= 1)
+        self.assertTrue(any("/api/crons/oneshot-1" in str(c) for c in delete_calls))
 
-    def test_monitor_skips_and_advances_on_crew_failure(self) -> None:
-        """7.5 — _schedule_monitor skips tick and advances when crew won't start."""
-        now = time.time()
-        sched = {
-            "job_id": "j1", "name": "check", "interval_secs": 300, "cron_expr": None,
-            "next_fire_at": now - 10, "agent": "ghost", "message": "do check", "enabled": True,
+
+# ── Task 4.x: TestIdleMonitorIteration ───────────────────────────────────────
+
+
+class _MockResponse:
+    """Minimal HTTP response double."""
+    def __init__(self, status_code=200, data=None):
+        self.status_code = status_code
+        self._data = data if data is not None else {}
+
+    def json(self):
+        return self._data
+
+
+class _FakeHTTPModule:
+    """Replaces monitors._http with scripted GET responses."""
+
+    def __init__(self):
+        self._responses = {}  # url-substring → _MockResponse
+        self._calls = []
+
+    def script(self, url_contains, response):
+        self._responses[url_contains] = response
+
+    def get(self, url, **kwargs):
+        self._calls.append(url)
+        for key, resp in self._responses.items():
+            if key in url:
+                return resp
+        return _MockResponse(200, {})
+
+
+class TestIdleMonitorIteration(unittest.TestCase):
+    """_idle_monitor iteration: single-tick body logic."""
+
+    CREW_ID = "crew-idle"
+    CONTAINER = "gs-crew-idle"
+    NOW = 2000.0  # fixed "now"
+
+    def _make_crew_entry(self, **kwargs):
+        entry = {
+            "container": self.CONTAINER,
+            "cookie": "tok",
+            "status": "running",
+            "last_used": self.NOW - 400,  # past idle timeout (300s)
+            "schedules": [],
         }
+        entry.update(kwargs)
+        return entry
 
-        # Simulate: _ensure_crew_running raises, so we advance
-        server._advance_next_fire_at(sched)
-        self.assertGreater(sched["next_fire_at"], now)
+    def setUp(self):
+        stubs = _make_stub_lifecycle(ga_idle_timeout_secs=300.0)
+        self._mint_cookie = stubs["mint_cookie"]
+        monitors.bind_lifecycle(**stubs)
+        # FakePodmanClient with the crew container running
+        self._podman = FakePodmanClient()
+        self._podman.add_container(self.CONTAINER, running=True)
+        # Default HTTP stubs: no active tasks, no cron jobs
+        self._http = _FakeHTTPModule()
+        self._http.script(
+            "/api/spawn",
+            _MockResponse(200, {"agents": [{"done": True}]}),
+        )
+        self._http.script(
+            "/api/crons",
+            _MockResponse(200, {"jobs": []}),
+        )
+        monitors._idle_skip_reasons.clear()
 
-    def test_reseed_crew_schedules_reregisters_missing_jobs(self) -> None:
-        """7.6 — _reseed_crew_schedules re-registers missing jobs in gateway."""
-        reg = {"crews": {"demo": {
-            "container": "gs-demo", "cookie": "cookie",
-            "schedules": [{
-                "job_id": "j1", "name": "daily-report", "interval_secs": 86400,
-                "cron_expr": None, "agent": "ghost", "message": "report",
-                "enabled": True, "next_fire_at": time.time() + 1000,
-            }],
-        }}}
-        api_calls = []
+    def tearDown(self):
+        monitors._idle_skip_reasons.clear()
 
-        def api(_crew, method, path, **kwargs):
-            api_calls.append((method, path, kwargs))
-            if method == "GET" and path == "/api/crons":
-                return {"jobs": []}  # No jobs in gateway
-            if method == "POST" and path == "/api/crons":
-                return {"id": "new-j1"}
-            return {}
+    def _run_one_tick(self, crews):
+        """Run exactly one idle-monitor body iteration.
 
-        crew = {"container": "gs-demo", "cookie": "cookie"}
-        save_calls = []
+        _idle_monitor sleeps at the TOP of its while loop before running the body.
+        Let the first sleep return normally; raise StopIteration on the second.
 
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            server._reseed_crew_schedules(crew, "demo", reg["crews"]["demo"])
-
-        # Verify POST to /api/crons was called to re-register
-        post_calls = [(m, p) for m, p, _ in api_calls if m == "POST" and p == "/api/crons"]
-        self.assertEqual(len(post_calls), 1)
-class ScheduleCancelTests(unittest.TestCase):
-    """Tests for schedule(action='cancel', ...)."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie"}
-
-    def test_cancel_success(self) -> None:
-        """4.1 — cancel removes the registry entry after gateway DELETE."""
-        # Seed a registry with a matching job_id entry
-        reg = {
-            "crews": {"demo": {
-                "container": "gs-demo", "cookie": "cookie",
-                "schedules": [
-                    {"job_id": "job-abc", "name": "my-job", "interval_secs": 60,
-                     "cron_expr": None, "agent": "ghost", "enabled": True},
-                ],
-            }}
-        }
-        save_calls = []
-
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        jobs_listing = {"jobs": [
-            {"id": "job-abc", "name": "my-job", "agent": "ghost", "enabled": True},
-        ]}
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            if method == "GET" and path == "/api/crons":
-                return jobs_listing
-            if method == "DELETE" and path == "/api/crons/job-abc":
-                return {}
-            raise AssertionError((method, path, kwargs))
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", side_effect=api),
-            patch.object(server, "_crew_api_with_recovery", side_effect=api),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            result = server.schedule(action="cancel", job_id="job-abc", crew_id="demo")
-
-        self.assertEqual(result, {"status": "cancelled", "job_id": "job-abc"})
-        # Verify the registry entry was removed
-        self.assertTrue(len(save_calls) > 0, "Expected _save_registry to be called")
-        last_reg = save_calls[-1]
-        remaining_ids = [s.get("job_id") for s in last_reg["crews"]["demo"]["schedules"]]
-        self.assertNotIn("job-abc", remaining_ids, "job-abc should have been removed from registry")
-
-    def test_cancel_not_found_is_idempotent(self) -> None:
-        """4.1 — cancel a non-existent job is idempotent (no error)."""
-        jobs_listing = {"jobs": []}
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            if method == "GET" and path == "/api/crons":
-                return jobs_listing
-            if method == "DELETE":
-                resp = Mock(status_code=404)
-                raise httpx.HTTPStatusError(
-                    "Not Found",
-                    request=None,
-                    response=resp,
-                )
-            raise AssertionError((method, path, kwargs))
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", side_effect=api),
-            patch.object(server, "_crew_api_with_recovery", side_effect=api),
-            patch.object(lifecycle, "_load_registry", return_value={"crews": {"demo": {"schedules": []}}}),
-            patch.object(server, "_load_registry", return_value={"crews": {"demo": {"schedules": []}}}),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-        ):
-            result = server.schedule(action="cancel", job_id="nonexistent", crew_id="demo")
-
-        self.assertEqual(result, {"status": "cancelled", "job_id": "nonexistent"})
-
-    def test_cancel_refuses_captain_checkin_job(self) -> None:
-        """4.2 — cancel refuses to cancel the captain check-in job."""
-        captain_job = {
-            "id": "captain-job-id",
-            "name": server._CAPTAIN_CHECKIN_JOB_NAME,
-            "agent": "raven",
-            "enabled": True,
-        }
-        jobs_listing = {"jobs": [captain_job]}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", return_value=jobs_listing),
-            patch.object(server, "_crew_api_with_recovery", return_value=jobs_listing),
-        ):
-            result = server.schedule(action="cancel", job_id="captain-job-id", crew_id="demo")
-
-        self.assertIn("Cannot cancel the Captain check-in job", result["error"])
-
-    def test_cancel_requires_job_id(self) -> None:
-        """cancel without job_id returns error."""
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-        ):
-            result = server.schedule(action="cancel", crew_id="demo")
-
-        self.assertIn("job_id is required", result["error"])
-class ScheduleCreateValidationTests(unittest.TestCase):
-    """Tests for schedule(action='create') input validation."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie"}
-
-    def test_create_requires_name(self) -> None:
-        """create without name returns error."""
-        result = server.schedule(action="create", message="do stuff", crew_id="demo", interval=60)
-        self.assertIn("name is required", result["error"])
-
-    def test_create_requires_message(self) -> None:
-        """create without message returns error."""
-        result = server.schedule(action="create", name="my-job", crew_id="demo", interval=60)
-        self.assertIn("message is required", result["error"])
-class ScheduleListTests(unittest.TestCase):
-    """Tests for schedule(action='list', ...)."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie"}
-
-    def test_list_with_jobs(self) -> None:
-        """4.3 — list returns jobs with expected fields."""
-        jobs_listing = {"jobs": [
-            {"id": "j1", "name": "daily-check", "schedule": "0 9 * * *", "agent": "ghost", "enabled": True, "last_run_ts": "2026-01-01T09:00:00"},
-            {"id": "j2", "name": "weekly-report", "schedule": "0 0 * * 1", "agent": "wraith", "enabled": False, "last_run_ts": None},
-        ]}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", return_value=jobs_listing),
-            patch.object(server, "_crew_api_with_recovery", return_value=jobs_listing),
-        ):
-            result = server.schedule(action="list", crew_id="demo")
-
-        self.assertEqual(len(result["jobs"]), 2)
-        self.assertEqual(result["jobs"][0]["job_id"], "j1")
-        self.assertEqual(result["jobs"][0]["name"], "daily-check")
-        self.assertEqual(result["jobs"][0]["agent"], "ghost")
-        self.assertTrue(result["jobs"][0]["enabled"])
-        self.assertEqual(result["jobs"][1]["job_id"], "j2")
-        self.assertFalse(result["jobs"][1]["enabled"])
-
-    def test_list_empty(self) -> None:
-        """4.3 — list returns empty jobs list when no jobs exist."""
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", return_value={"jobs": []}),
-            patch.object(server, "_crew_api_with_recovery", return_value={"jobs": []}),
-        ):
-            result = server.schedule(action="list", crew_id="demo")
-
-        self.assertEqual(result, {"jobs": []})
-
-    def test_list_falls_back_to_gateway_when_registry_empty(self) -> None:
-        """4.1b — schedule(list) falls back to gateway /api/crons when registry is empty."""
-        # Registry has no schedules for this crew
-        reg_empty = {"crews": {"demo": {"container": "gs-demo", "cookie": "cookie", "schedules": []}}}
-        gateway_jobs = {"jobs": [
-            {"id": "gw-j1", "name": "gateway-job", "schedule": "every 60s",
-             "agent": "ghost", "enabled": True, "last_run_ts": None},
-        ]}
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=reg_empty),
-            patch.object(server, "_load_registry", return_value=reg_empty),
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", return_value=gateway_jobs) as api_mock,
-            patch.object(server, "_crew_api_with_recovery", return_value=gateway_jobs) as api_mock,
-        ):
-            result = server.schedule(action="list", crew_id="demo")
-
-        # The gateway /api/crons GET must have been called as fallback
-        api_mock.assert_called_once()
-        call_args = api_mock.call_args
-        self.assertEqual(call_args.args[2], "GET")
-        self.assertEqual(call_args.args[3], "/api/crons")
-        # The gateway's job should appear in the result
-        self.assertEqual(len(result["jobs"]), 1)
-        self.assertEqual(result["jobs"][0]["job_id"], "gw-j1")
-        self.assertEqual(result["jobs"][0]["name"], "gateway-job")
-class SchedulePersistenceTests(unittest.TestCase):
-    """Tests for transport schedule persistence."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie"}
-
-    def _make_registry(self, crew_id: str = "demo", schedules: list | None = None) -> dict:
-        return {"crews": {crew_id: {"container": "gs-demo", "cookie": "cookie", "schedules": schedules or []}}}
-
-    def test_captain_order_writes_schedule_entry(self) -> None:
-        """7.1 — captain(action='order') writes schedule entry to registry."""
-        reg = self._make_registry()
-        # Add enrolled_agents so dispatch can find raven
-        reg["crews"]["demo"]["enrolled_agents"] = ["raven"]
-        save_calls = []
-
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            if method == "POST" and "/api/spawn" in path:
-                return {"id": "task-1"}
-            return {}
-
-        fake_podman = SetupPodman()
-        fake_podman.container_exec = lambda *a, **kw: ""
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", side_effect=api),
-            patch.object(server, "_crew_api_with_recovery", side_effect=api),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-            patch.object(lifecycle, "_get_podman", return_value=fake_podman),
-            patch.object(server, "_get_podman", return_value=fake_podman),
-            patch.object(server, "_append_captain_mail"),
-        ):
-            result = server.captain(
-                crew_id="demo", action="order", message="do stuff", interval=300,
-                model="claude-opus-5",
-            )
-
-        self.assertEqual(result["status"], "ordered")
-        # New model: no gateway job_id
-        self.assertIsNone(result["job_id"])
-        # Verify registry was written with captain schedule entry
-        self.assertTrue(len(save_calls) > 0)
-        last_reg = save_calls[-1]
-        schedules = last_reg["crews"]["demo"]["schedules"]
-        self.assertEqual(len(schedules), 1)
-        self.assertEqual(schedules[0]["type"], "captain")
-        self.assertEqual(schedules[0]["name"], "captain")
-        self.assertEqual(schedules[0]["agent"], "raven")
-        self.assertEqual(schedules[0]["model"], "claude-opus-5")
-        self.assertTrue(schedules[0]["enabled"])
-
-    def test_schedule_list_returns_registry_entries_when_stopped(self) -> None:
-        """7.2 — schedule(action='list') returns registry entries when crew stopped."""
-        reg = self._make_registry(schedules=[
-            {"job_id": "j1", "name": "daily-check", "interval_secs": 3600, "cron_expr": None,
-             "agent": "ghost", "enabled": True, "next_fire_at": 9999999999.0},
-        ])
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-        ):
-            result = server._schedule_list("demo")
-
-        self.assertEqual(len(result["jobs"]), 1)
-        self.assertEqual(result["jobs"][0]["job_id"], "j1")
-        self.assertEqual(result["jobs"][0]["name"], "daily-check")
-        self.assertEqual(result["jobs"][0]["agent"], "ghost")
-        self.assertTrue(result["jobs"][0]["enabled"])
-
-    def test_schedule_cancel_removes_from_registry(self) -> None:
-        """7.3 — schedule(action='cancel') removes from registry."""
-        reg = self._make_registry(schedules=[
-            {"job_id": "j1", "name": "my-job", "interval_secs": 60, "cron_expr": None,
-             "agent": "ghost", "enabled": True},
-        ])
-        save_calls = []
-
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        jobs_listing = {"jobs": [
-            {"id": "j1", "name": "my-job", "agent": "ghost", "enabled": True},
-        ]}
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            if method == "GET" and path == "/api/crons":
-                return jobs_listing
-            if method == "DELETE":
-                return {}
-            return {}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", side_effect=api),
-            patch.object(server, "_crew_api_with_recovery", side_effect=api),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            result = server._schedule_cancel("j1", "demo")
-
-        self.assertEqual(result, {"status": "cancelled", "job_id": "j1"})
-        # Verify registry no longer has the job
-        self.assertTrue(len(save_calls) > 0)
-        last_reg = save_calls[-1]
-        schedules = last_reg["crews"]["demo"]["schedules"]
-        self.assertEqual(len(schedules), 0)
-
-    def test_schedule_delay_creates_one_shot_registry_entry(self) -> None:
-        """7.7 — schedule(delay=N) creates one-shot entry in registry."""
-        reg = self._make_registry()
-        save_calls = []
-
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", return_value={"id": "delay-job-1"}),
-            patch.object(server, "_crew_api_with_recovery", return_value={"id": "delay-job-1"}),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            result = server.schedule(
-                name="cleanup", message="run cleanup", agent="ghost",
-                crew_id="demo", delay=300, model="claude-sonnet-5",
-            )
-
-        self.assertEqual(result["job_id"], "delay-job-1")
-        self.assertEqual(result["status"], "scheduled")
-        self.assertEqual(result["delay"], 300)
-        # Verify registry was written with one-shot entry
-        self.assertTrue(len(save_calls) > 0)
-        last_reg = save_calls[-1]
-        schedules = last_reg["crews"]["demo"]["schedules"]
-        self.assertEqual(len(schedules), 1)
-        self.assertEqual(schedules[0]["job_id"], "delay-job-1")
-        self.assertEqual(schedules[0]["model"], "claude-sonnet-5")
-        self.assertTrue(schedules[0].get("one_shot"))
-
-    def test_dispatch_no_longer_accepts_delay(self) -> None:
-        """7.8 — dispatch no longer accepts delay parameter."""
-        import inspect
-        sig = inspect.signature(server.dispatch)
-        self.assertNotIn("delay", sig.parameters)
-
-    def test_registry_rejects_inf_in_next_fire_at(self) -> None:
-        """One-shot job with float('inf') must not be JSON-serialisable.
-
-        Uses _NEVER_FIRE_AT (9_999_999_999.0) to
-        ensure the registry can always be serialised with allow_nan=False.
-        This test confirms the guard is the correct fix: float('inf') DOES raise.
+        Sets self._mock_touch and self._last_reg for post-run inspection.
         """
-        reg = self._make_registry(schedules=[{
-            "job_id": "j-inf", "name": "one-shot", "interval_secs": None,
-            "cron_expr": None, "agent": "ghost", "enabled": True,
-            "next_fire_at": float("inf"),
-        }])
-        with self.assertRaises(ValueError):
-            json.dumps(reg, allow_nan=False)
-
-    def test_captain_resume_sets_next_fire_at(self) -> None:
-        """7.x — captain resume sets next_fire_at ≈ now + interval in registry."""
-        interval = 300
-        reg = self._make_registry(schedules=[
-            # Existing disabled captain entry (new model: type==captain)
-            {"type": "captain", "name": "captain", "interval_secs": interval,
-             "cron_expr": None, "agent": "raven", "enabled": False,
-             "next_fire_at": 0.0, "current_task_id": None},
-        ])
-        reg["crews"]["demo"]["enrolled_agents"] = ["raven"]
-        save_calls = []
-
-        def fake_save(r):
-            save_calls.append(json.loads(json.dumps(r)))
-
-        fake_podman = SetupPodman()
-        fake_podman.container_exec = lambda *a, **kw: ""
-
-        before = time.time()
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-            patch.object(lifecycle, "_get_podman", return_value=fake_podman),
-            patch.object(server, "_get_podman", return_value=fake_podman),
-            patch.object(server, "_append_captain_mail"),
-        ):
-            result = server.captain(
-                crew_id="demo", action="order", message="check in", interval=interval,
-            )
-
-        self.assertEqual(result.get("status"), "ordered")
-        self.assertTrue(len(save_calls) > 0)
-        last_reg = save_calls[-1]
-        schedules = last_reg["crews"]["demo"]["schedules"]
-        self.assertEqual(len(schedules), 1)
-        entry = schedules[0]
-        self.assertGreaterEqual(
-            entry["next_fire_at"], before + interval - 1,
-            f"next_fire_at {entry['next_fire_at']!r} should be ≈ now+{interval}",
-        )
-class ReseedCronReconcileTests(unittest.TestCase):
-    """Tests for the gateway→registry reconcile pass in _reseed_crew_schedules."""
-
-    def _make_reg(self, schedules):
-        return {"crews": {"demo": {
-            "container": "gs-demo", "cookie": "cookie",
-            "schedules": schedules,
-        }}}
-
-    def test_reconcile_paused_job_updates_registry(self) -> None:
-        """2.1 — gateway reports job enabled=false → registry updated, job not re-registered."""
-        reg = self._make_reg([{
-            "job_id": "j1", "name": "captain", "interval_secs": 300,
-            "cron_expr": None, "agent": "raven", "message": "check-in",
-            "model": "old-model", "enabled": True,  # stale: registry says enabled
-        }])
-        api_calls = []
-
-        def api(_crew, method, path, **kwargs):
-            api_calls.append((method, path))
-            if method == "GET" and path == "/api/crons":
-                return {
-                    "jobs": [{
-                        "id": "j1", "enabled": False, "every_secs": 300,
-                        "model": "new-model",
-                    }]
-                }
-            return {}
-
-        saved = []
-
-        def fake_save(r):
-            saved.append(json.loads(json.dumps(r)))
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(server, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            server._reseed_crew_schedules(
-                {"container": "gs-demo", "cookie": "cookie"}, "demo", reg["crews"]["demo"]
-            )
-
-        # Registry should have been saved with enabled=False
-        self.assertTrue(saved, "Registry should have been saved after reconcile")
-        sched = saved[-1]["crews"]["demo"]["schedules"][0]
-        self.assertFalse(sched["enabled"], "Registry entry should be updated to enabled=False")
-        self.assertEqual(sched["model"], "new-model")
-
-        # No POST to re-register the paused job
-        post_calls = [p for m, p in api_calls if m == "POST"]
-        self.assertEqual(post_calls, [], "Paused job should not be re-registered")
-
-    def test_reconcile_absent_job_left_for_reseed(self) -> None:
-        """2.2 — gateway does not include job → entry kept in registry, reseeded as bootstrap."""
-        reg = self._make_reg([{
-            "job_id": "j1", "name": "captain", "interval_secs": 300,
-            "cron_expr": None, "agent": "raven", "message": "check-in",
-            "enabled": True,
-        }])
-        api_calls = []
-
-        def api(_crew, method, path, **kwargs):
-            api_calls.append((method, path))
-            if method == "GET" and path == "/api/crons":
-                return {"jobs": []}  # Job absent — bootstrap case
-            if method == "POST" and path == "/api/crons":
-                return {"id": "j1"}
-            return {}
-
-        saved = []
-
-        def fake_save(r):
-            saved.append(json.loads(json.dumps(r)))
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(server, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            server._reseed_crew_schedules(
-                {"container": "gs-demo", "cookie": "cookie"}, "demo", reg["crews"]["demo"]
-            )
-
-        # Job should be reseeded (POST) — absent from gateway is the bootstrap case
-        post_calls = [p for m, p in api_calls if m == "POST" and p == "/api/crons"]
-        self.assertEqual(len(post_calls), 1, "Absent enabled job should be reseeded")
-
-    def test_reseed_missing_job_registered_in_gateway(self) -> None:
-        """2.3 — registry has enabled job absent from gateway → job registered (bootstrap)."""
-        reg = self._make_reg([{
-            "job_id": "j1", "name": "captain", "interval_secs": 300,
-            "cron_expr": None, "agent": "raven", "message": "check-in",
-            "enabled": True,
-        }])
-        api_calls = []
-
-        def api(_crew, method, path, **kwargs):
-            api_calls.append((method, path))
-            if method == "GET" and path == "/api/crons":
-                return {"jobs": []}  # Missing from gateway — bootstrap case
-            if method == "POST" and path == "/api/crons":
-                return {"id": "j1-new"}
-            return {}
-
-        saved = []
-
-        def fake_save(r):
-            saved.append(json.loads(json.dumps(r)))
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(server, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            server._reseed_crew_schedules(
-                {"container": "gs-demo", "cookie": "cookie"}, "demo", reg["crews"]["demo"]
-            )
-
-        # POST should have been made to register the missing job
-        post_calls = [p for m, p in api_calls if m == "POST" and p == "/api/crons"]
-        self.assertEqual(len(post_calls), 1, "Missing enabled job should be re-registered")
-
-    def test_reconcile_gateway_error_skips_both_passes(self) -> None:
-        """2.4 — gateway /api/crons returns error → both passes skipped, registry unchanged."""
-        reg = self._make_reg([{
-            "job_id": "j1", "name": "captain", "interval_secs": 300,
-            "cron_expr": None, "agent": "raven", "message": "check-in",
-            "enabled": True,
-        }])
-
-        def api(_crew, method, path, **kwargs):
-            raise RuntimeError("gateway unavailable")
-
-        saved = []
-
-        def fake_save(r):
-            saved.append(r)
-
-        with (
-            patch.object(lifecycle, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(server, "_load_registry", return_value=json.loads(json.dumps(reg))),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-            patch.object(lifecycle, "_save_registry", side_effect=fake_save),
-            patch.object(server, "_save_registry", side_effect=fake_save),
-        ):
-            server._reseed_crew_schedules(
-                {"container": "gs-demo", "cookie": "cookie"}, "demo", reg["crews"]["demo"]
-            )
-
-        # Registry should not have been touched
-        self.assertEqual(saved, [], "Registry should not be saved when gateway errors")
-class NukeScheduleTests(unittest.TestCase):
-    """Tests for nuke schedule reporting and clearing."""
-
-    CREW = {
-        "container": "gs-demo",
-        "volume": "gs-vol-demo",
-        "home_volume": "gs-home-demo",
-    }
-
-    def _reg_with_schedules(self, schedules: list) -> dict:
-        return {"crews": {"demo": {**self.CREW, "schedules": schedules}}}
-
-    # ── 3.1: dry-run with two schedule entries ─────────────────────────────
-
-    def test_dry_run_reports_two_scheduled_jobs(self) -> None:
-        """3.1 — dry-run returns scheduled_jobs:2 and both names."""
-        schedules = [
-            {"job_id": "j1", "name": "daily-check", "interval_secs": 86400,
-             "cron_expr": None, "agent": "ghost", "enabled": True},
-            {"job_id": "j2", "name": "weekly-report", "interval_secs": None,
-             "cron_expr": "0 9 * * 1", "agent": "wraith", "enabled": True},
-        ]
-        reg = self._reg_with_schedules(schedules)
-        with (
-            patch.object(lifecycle, "_get_crew", return_value=self.CREW),
-            patch.object(server, "_get_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", return_value={"agents": []}),
-            patch.object(server, "_crew_api", return_value={"agents": []}),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-        ):
-            result = server.nuke("demo", confirm=False)
-
-        self.assertEqual(result["scheduled_jobs"], 2)
-        self.assertIn("daily-check", result["scheduled_job_names"])
-        self.assertIn("weekly-report", result["scheduled_job_names"])
-        self.assertIn("warning", result)
-
-    # ── 3.2: dry-run with no schedule entries ─────────────────────────────
-
-    def test_dry_run_reports_zero_scheduled_jobs(self) -> None:
-        """3.2 — dry-run returns scheduled_jobs:0 and empty list when no schedules."""
-        reg = self._reg_with_schedules([])
-        with (
-            patch.object(lifecycle, "_get_crew", return_value=self.CREW),
-            patch.object(server, "_get_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", return_value={"agents": []}),
-            patch.object(server, "_crew_api", return_value={"agents": []}),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-        ):
-            result = server.nuke("demo", confirm=False)
-
-        self.assertEqual(result["scheduled_jobs"], 0)
-        self.assertEqual(result["scheduled_job_names"], [])
-        self.assertIn("warning", result)
-
-    # ── 3.3: confirmed nuke issues DELETE for each schedule entry ──────────
-
-    def test_confirmed_nuke_cancels_each_schedule_before_cleanup(self) -> None:
-        """3.3 — confirmed nuke calls DELETE /api/crons/<id> for each entry before _cleanup_crew."""
-        schedules = [
-            {"job_id": "j1", "name": "check", "interval_secs": 300,
-             "cron_expr": None, "agent": "ghost", "enabled": True},
-            {"job_id": "j2", "name": "report", "interval_secs": None,
-             "cron_expr": "0 9 * * 1", "agent": "wraith", "enabled": True},
-        ]
-        reg = self._reg_with_schedules(schedules)
-        api_calls: list[tuple[str, str]] = []
-        cleanup_called_after: list[str] = []
-
-        def fake_crew_api(crew, method, path, **kwargs):
-            api_calls.append((method, path))
-            return {}
-
-        def fake_cleanup(*args, **kwargs):
-            # Record which DELETE calls have been made by the time cleanup is called
-            cleanup_called_after.extend([p for m, p in api_calls if m == "DELETE"])
-
-        with (
-            patch.object(lifecycle, "_get_crew", return_value=self.CREW),
-            patch.object(server, "_get_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_get_podman", return_value=Mock()),
-            patch.object(server, "_get_podman", return_value=Mock()),
-            patch.object(lifecycle, "_crew_api", side_effect=fake_crew_api),
-            patch.object(server, "_crew_api", side_effect=fake_crew_api),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-            patch.object(lifecycle, "_cleanup_crew", side_effect=fake_cleanup),
-            patch.object(server, "_cleanup_crew", side_effect=fake_cleanup),
-        ):
-            result = server.nuke("demo", confirm=True)
-
-        self.assertEqual(result["status"], "nuked")
-        delete_paths = [p for m, p in api_calls if m == "DELETE"]
-        self.assertIn("/api/crons/j1", delete_paths)
-        self.assertIn("/api/crons/j2", delete_paths)
-        # Both DELETEs must have been issued before _cleanup_crew was invoked
-        self.assertIn("/api/crons/j1", cleanup_called_after)
-        self.assertIn("/api/crons/j2", cleanup_called_after)
-
-    # ── 3.4: DELETE failure does not block teardown ────────────────────────
-
-    def test_confirmed_nuke_delete_failure_does_not_block_teardown(self) -> None:
-        """3.4 — DELETE failure is caught, WARNING logged, and _cleanup_crew still called."""
-        schedules = [
-            {"job_id": "j1", "name": "check", "interval_secs": 300,
-             "cron_expr": None, "agent": "ghost", "enabled": True},
-        ]
-        reg = self._reg_with_schedules(schedules)
-
-        def failing_crew_api(crew, method, path, **kwargs):
-            if method == "DELETE":
-                raise RuntimeError("gateway unreachable")
-            return {}
-
-        with (
-            patch.object(lifecycle, "_get_crew", return_value=self.CREW),
-            patch.object(server, "_get_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_get_podman", return_value=Mock()),
-            patch.object(server, "_get_podman", return_value=Mock()),
-            patch.object(lifecycle, "_crew_api", side_effect=failing_crew_api),
-            patch.object(server, "_crew_api", side_effect=failing_crew_api),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-            patch.object(lifecycle, "_cleanup_crew") as cleanup,
-            patch.object(server, "_cleanup_crew") as cleanup,
-            self.assertLogs("transport", level="WARNING") as log_ctx,
-        ):
-            result = server.nuke("demo", confirm=True)
-
-        self.assertEqual(result["status"], "nuked")
-        cleanup.assert_called_once()
-        self.assertTrue(any("nuke: failed to cancel cron" in msg for msg in log_ctx.output))
-        self.assertTrue(any("j1" in msg for msg in log_ctx.output))
-
-    # ── 3.5: confirmed nuke with no schedules issues no DELETE calls ───────
-
-    def test_confirmed_nuke_no_schedules_no_delete_calls(self) -> None:
-        """3.5 — confirmed nuke with no schedules issues no DELETE calls and teardown proceeds."""
-        reg = self._reg_with_schedules([])
-        api_calls: list[tuple[str, str]] = []
-
-        def fake_crew_api(crew, method, path, **kwargs):
-            api_calls.append((method, path))
-            return {}
-
-        with (
-            patch.object(lifecycle, "_get_crew", return_value=self.CREW),
-            patch.object(server, "_get_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_get_podman", return_value=Mock()),
-            patch.object(server, "_get_podman", return_value=Mock()),
-            patch.object(lifecycle, "_crew_api", side_effect=fake_crew_api),
-            patch.object(server, "_crew_api", side_effect=fake_crew_api),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-            patch.object(lifecycle, "_cleanup_crew") as cleanup,
-            patch.object(server, "_cleanup_crew") as cleanup,
-        ):
-            result = server.nuke("demo", confirm=True)
-
-        self.assertEqual(result["status"], "nuked")
-        cleanup.assert_called_once()
-        delete_calls = [(m, p) for m, p in api_calls if m == "DELETE"]
-        self.assertEqual(delete_calls, [])
-class FireImmediatelyTests(unittest.TestCase):
-    """Tests for fire_immediately behavior in schedule() and captain()."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie"}
-
-    # ── schedule() tests ──────────────────────────────────────────────────────
-
-    def test_schedule_interval_no_fire_immediately_defaults_true(self) -> None:
-        """3.2 — schedule() with interval and no fire_immediately → immediate dispatch."""
-        dispatch_calls: list[dict] = []
-
-        def api(_crew, method, path, **kwargs):
-            if method == "POST" and path == "/api/spawn":
-                dispatch_calls.append(kwargs.get("json", {}))
-            return {"id": "job-1"}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-        ):
-            result = server.schedule(
-                "task", "do work", crew_id="demo", interval=120,
-                model="claude-sonnet-5",
-            )
-
-        self.assertEqual(result["status"], "scheduled")
-        self.assertEqual(len(dispatch_calls), 1)
-        self.assertEqual(dispatch_calls[0]["task"], "do work")
-        self.assertEqual(dispatch_calls[0]["model"], "claude-sonnet-5")
-
-    def test_schedule_cron_no_fire_immediately_defaults_false(self) -> None:
-        """3.3 — schedule() with cron and no fire_immediately → no immediate dispatch."""
-        api_paths: list[str] = []
-
-        def api(_crew, method, path, **kwargs):
-            api_paths.append(f"{method} {path}")
-            return {"id": "job-1"}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-        ):
-            result = server.schedule(
-                "task", "do work", crew_id="demo", cron="0 9 * * 1"
-            )
-
-        self.assertEqual(result["status"], "scheduled")
-        # Only the cron creation POST, no /api/spawn dispatch
-        self.assertNotIn("POST /api/spawn", api_paths)
-        self.assertIn("POST /api/crons", api_paths)
-
-    def test_schedule_fire_immediately_true_with_cron(self) -> None:
-        """3.4 — schedule() with fire_immediately=True and cron → immediate dispatch occurs."""
-        dispatch_calls: list[dict] = []
-
-        def api(_crew, method, path, **kwargs):
-            if method == "POST" and path == "/api/spawn":
-                dispatch_calls.append(kwargs.get("json", {}))
-            return {"id": "job-1"}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-        ):
-            result = server.schedule(
-                "task", "do work", crew_id="demo",
-                cron="0 9 * * 1", fire_immediately=True
-            )
-
-        self.assertEqual(result["status"], "scheduled")
-        self.assertEqual(len(dispatch_calls), 1)
-        self.assertEqual(dispatch_calls[0]["task"], "do work")
-
-    def test_schedule_fire_immediately_false_with_interval(self) -> None:
-        """3.5 — schedule() with fire_immediately=False and interval → no immediate dispatch."""
-        api_paths: list[str] = []
-
-        def api(_crew, method, path, **kwargs):
-            api_paths.append(f"{method} {path}")
-            return {"id": "job-1"}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-        ):
-            result = server.schedule(
-                "task", "do work", crew_id="demo",
-                interval=120, fire_immediately=False
-            )
-
-        self.assertEqual(result["status"], "scheduled")
-        self.assertNotIn("POST /api/spawn", api_paths)
-
-
-
-    def test_schedule_immediate_dispatch_failure_does_not_prevent_job_creation(self) -> None:
-        """3.10 — immediate dispatch failure does not prevent job creation."""
-        call_count = [0]
-
-        def api(_crew, method, path, **kwargs):
-            call_count[0] += 1
-            if method == "POST" and path == "/api/crons":
-                return {"id": "job-1"}
-            if method == "POST" and path == "/api/spawn":
-                raise RuntimeError("dispatch failed")
-            return {}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api", side_effect=api),
-            patch.object(server, "_crew_api", side_effect=api),
-        ):
-            result = server.schedule("task", "do work", crew_id="demo", interval=120)
-
-        # Job was still created
-        self.assertEqual(result["job_id"], "job-1")
-        self.assertEqual(result["status"], "scheduled")
-        # Error is reported in the result, not raised
-        self.assertIn("immediate_dispatch_error", result)
-        self.assertIn("dispatch failed", result["immediate_dispatch_error"])
-
-    # ── captain() tests ───────────────────────────────────────────────────────
-
-    def test_captain_order_interval_new_job_immediate_dispatch(self) -> None:
-        """3.7 — captain(action="order") with interval and new check-in → immediate Raven dispatch."""
-        podman = Mock()
-        spawn_calls: list[dict] = []
-        reg = {"crews": {"demo": {"container": "gs-demo", "cookie": "cookie",
-                                  "enrolled_agents": ["raven"], "schedules": []}}}
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            if method == "POST" and "/api/spawn" in path:
-                spawn_calls.append(kwargs.get("json", {}))
-                return {"id": "immediate-task"}
-            return {}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_get_podman", return_value=podman),
-            patch.object(server, "_get_podman", return_value=podman),
-            patch.object(server, "_append_captain_mail"),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-            patch.object(lifecycle, "_crew_api_with_recovery", side_effect=api),
-            patch.object(server, "_crew_api_with_recovery", side_effect=api),
-        ):
-            result = server.captain(
-                "demo", "order", message="hold", interval=120,
-                model="claude-opus-5",
-            )
-
-        self.assertEqual(result["status"], "ordered")
-        # Exactly one immediate dispatch to Raven with member-raven slot
-        self.assertEqual(len(spawn_calls), 1)
-        self.assertEqual(spawn_calls[0]["agent"], "raven")
-        self.assertEqual(spawn_calls[0]["parent_session"], "dashboard:member-raven")
-        self.assertEqual(spawn_calls[0]["model"], "claude-opus-5")
-
-    def test_captain_order_resume_no_immediate_dispatch(self) -> None:
-        """3.8 — captain(action="order") resume of paused captain entry → no immediate dispatch."""
-        existing_entry = {
-            "type": "captain",
-            "name": "captain",
-            "enabled": False,
-            "interval_secs": 300,
-            "cron_expr": None,
-            "next_fire_at": 9999999999.0,
-            "current_task_id": "task-paused",
-            "model": None,
-        }
-        reg = {"crews": {"demo": {"container": "gs-demo", "cookie": "cookie",
-                                  "enrolled_agents": ["raven"],
-                                  "schedules": [existing_entry]}}}
-        podman = Mock()
-        spawn_paths: list[str] = []
-
-        def api(_crew, _crew_id, method, path, **kwargs):
-            spawn_paths.append(f"{method} {path}")
-            return {"id": "task-1"}
-
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_get_podman", return_value=podman),
-            patch.object(server, "_get_podman", return_value=podman),
-            patch.object(server, "_append_captain_mail"),
-            patch.object(lifecycle, "_load_registry", return_value=reg),
-            patch.object(server, "_load_registry", return_value=reg),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-            patch.object(lifecycle, "_crew_api_with_recovery", side_effect=api),
-            patch.object(server, "_crew_api_with_recovery", side_effect=api),
-        ):
-            result = server.captain("demo", "order", message="resume this")
-
-        self.assertEqual(result["status"], "ordered")
-        # No immediate dispatch for a resume (fire_immediately not set)
-        self.assertFalse(any("spawn" in p for p in spawn_paths))
-class DispatchFireAfterTests(unittest.TestCase):
-    """Tests for schedule(delay=...)."""
-
-    CREW = {"container": "gs-demo", "cookie": "cookie"}
-
-    def test_delay_creates_one_shot_via_schedule(self) -> None:
-        """6.3 — schedule(delay=N) creates a one-shot cron job."""
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(lifecycle, "_crew_api_with_recovery", return_value={"id": "delayed-job-1"}) as api,
-            patch.object(server, "_crew_api_with_recovery", return_value={"id": "delayed-job-1"}) as api,
-            patch.object(lifecycle, "_load_registry", return_value={"crews": {"demo": {"schedules": []}}}),
-            patch.object(server, "_load_registry", return_value={"crews": {"demo": {"schedules": []}}}),
-            patch.object(lifecycle, "_save_registry"),
-            patch.object(server, "_save_registry"),
-        ):
-            result = server.schedule(
-                name="cleanup", message="run cleanup", agent="ghost", crew_id="demo", delay=300
-            )
-
-        self.assertEqual(result["job_id"], "delayed-job-1")
-        self.assertEqual(result["status"], "scheduled")
-        self.assertEqual(result["delay"], 300)
-
-        # Verify it called POST /api/crons with a cron expression
-        api.assert_called_once()
-        call_kwargs = api.call_args.kwargs
-        cron_expr = call_kwargs["json"].get("cron", "")
-        self.assertEqual(len(cron_expr.split()), 5, f"Expected 5-field cron expr, got: {cron_expr!r}")
-        self.assertNotIn("delay", call_kwargs["json"])
-        self.assertEqual(call_kwargs["json"]["agent"], "ghost")
-        self.assertEqual(call_kwargs["json"]["message"], "run cleanup")
-
-    def test_delay_zero_rejected(self) -> None:
-        """6.3 — schedule(delay=0) returns validation error."""
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-        ):
-            result = server.schedule(
-                name="cleanup", message="run cleanup", crew_id="demo", delay=0
-            )
-
-        self.assertEqual(result, {"error": "delay must be >= 1"})
-
-    def test_delay_negative_rejected(self) -> None:
-        """6.3 — schedule(delay=-5) returns validation error."""
-        with (
-            patch.object(lifecycle, "_require_crew", return_value=self.CREW),
-            patch.object(server, "_require_crew", return_value=self.CREW),
-            patch.object(lifecycle, "_ensure_crew_running", return_value=self.CREW),
-            patch.object(server, "_ensure_crew_running", return_value=self.CREW),
-        ):
-            result = server.schedule(
-                name="cleanup", message="run cleanup", crew_id="demo", delay=-5
-            )
-
-        self.assertEqual(result, {"error": "delay must be >= 1"})
-
-
-class IdleMonitorResilienceTests(unittest.TestCase):
-    """0.6.0 review fixes: the reaper survives errors and records skip reasons."""
-
-    def _crew(self, cid: str) -> dict:
-        return {"container": f"gs-{cid}", "cookie": "c", "last_used": 0, "status": "running"}
-
-    def _run_loop(self, podman, registry_side_effect, http_responses, iterations: int = 1):
-        calls = [0]
-
-        def fake_sleep(secs: float) -> None:
-            calls[0] += 1
-            if calls[0] > iterations:
-                raise StopIteration()
-
-        with (
-            patch.object(monitors, "_get_podman", return_value=podman),
-            patch.object(monitors, "_http", FakeHTTP(list(http_responses), default=FakeResponse(200, json_data={"agents": []}))),
-            patch.object(monitors, "_touch_crew"),
-            patch.object(monitors, "_load_registry", side_effect=registry_side_effect),
-            patch.object(monitors, "_save_registry"),
-            patch.object(monitors, "_mint_cookie", return_value=None),
-            patch.object(monitors.time, "sleep", side_effect=fake_sleep),
-            patch.object(monitors.time, "time", return_value=10_000.0),
-        ):
+        reg = _make_reg(crews)
+
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(monitors, "_get_podman", return_value=self._podman), \
+             patch.object(monitors, "_http", self._http), \
+             patch.object(monitors, "_touch_crew") as mock_touch, \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
+            self._mock_touch = mock_touch
+            self._last_reg = reg
             try:
                 monitors._idle_monitor()
             except StopIteration:
                 pass
 
-    def test_iteration_error_does_not_end_the_monitor(self):
-        podman = IdleMonitorPodman()
-        regs = [RuntimeError("registry unreadable"), {"crews": {"a": self._crew("a")}}, {"crews": {"a": self._crew("a")}}]
-        responses = [MockHTTPResponse(200, {"agents": []}), MockHTTPResponse(200, {"jobs": []})]
-        with self.assertLogs(monitors.logger, level="ERROR") as logs:
-            self._run_loop(podman, regs, responses, iterations=2)
-        self.assertTrue(any("Idle monitor iteration failed" in m for m in logs.output))
-        self.assertEqual(podman.stops, ["gs-a"], "second iteration must still reap the idle crew")
+    def test_active_task_not_stopped_touch_called(self):
+        """Crew with active task (done=False in /api/spawn) → container_stop not called, _touch_crew called."""
+        self._http.script(
+            "/api/spawn",
+            _MockResponse(200, {"agents": [{"done": False}]}),
+        )
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        self.assertFalse(self._podman.was_called("container_stop"))
+        self._mock_touch.assert_called_with(self.CREW_ID)
 
-    def test_one_stop_failure_does_not_block_other_crews(self):
-        class FlakyPodman(IdleMonitorPodman):
-            def container_stop(self, name: str) -> None:
-                if name == "gs-a":
-                    raise RuntimeError("podman 500")
-                super().container_stop(name)
+    def test_cron_enabled_not_stopped(self):
+        """/api/crons returns a job with enabled=True → container_stop not called."""
+        self._http.script(
+            "/api/crons",
+            _MockResponse(200, {"jobs": [{"enabled": True}]}),
+        )
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        self.assertFalse(self._podman.was_called("container_stop"))
 
-        podman = FlakyPodman()
-        reg = {"crews": {"a": self._crew("a"), "b": self._crew("b")}}
-        responses = [MockHTTPResponse(200, {"agents": []}), MockHTTPResponse(200, {"jobs": []})] * 2
-        self._run_loop(podman, lambda: dict(reg), responses + [MockHTTPResponse(200, {})] * 4)
-        self.assertEqual(podman.stops, ["gs-b"])
+    def test_cron_recent_last_run_ts_not_stopped(self):
+        """job last_run_ts more recent than last_used → container_stop not called."""
+        entry = self._make_crew_entry()
+        last_used = entry["last_used"]
+        self._http.script(
+            "/api/crons",
+            _MockResponse(200, {"jobs": [{"last_run_ts": last_used + 10}]}),
+        )
+        self._run_one_tick({self.CREW_ID: entry})
+        self.assertFalse(self._podman.was_called("container_stop"))
 
-    def test_skip_reason_logged_once_when_unchanged(self):
+    def test_no_active_tasks_no_cron_stops_container(self):
+        """No active tasks and no cron jobs → container_stop called, status set to 'stopped'."""
+        entry = self._make_crew_entry()
+        self._run_one_tick({self.CREW_ID: entry})
+        self.assertTrue(self._podman.was_called("container_stop"))
+        # Verify status was updated in the registry
+        status = self._last_reg["crews"].get(self.CREW_ID, {}).get("status")
+        self.assertEqual(status, "stopped")
+
+    def test_container_not_running_skip(self):
+        """Container not running → container_stop not called."""
+        self._podman = FakePodmanClient()
+        self._podman.add_container(self.CONTAINER, running=False)
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_auth_required_status_skipped(self):
+        """status=='auth_required' → skipped entirely, container_stop not called."""
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(status="auth_required")})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_within_idle_timeout_not_stopped(self):
+        """last_used within GA_IDLE_TIMEOUT_SECS → not stopped."""
+        # last_used only 10s ago, timeout is 300s
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(last_used=self.NOW - 10)})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_spawn_401_mint_cookie_succeeds_retries(self):
+        """/api/spawn returns 401 AND _mint_cookie returns new cookie → request retried."""
+        responses = {"calls": 0}
+
+        def patched_get(url, **kwargs):
+            if "/api/spawn" in url:
+                responses["calls"] += 1
+                if responses["calls"] == 1:
+                    return _MockResponse(401)
+                return _MockResponse(200, {"agents": []})
+            return _MockResponse(200, {"jobs": []})
+
+        self._http.get = patched_get
+        self._mint_cookie.return_value = "new-cookie-value"
+        monitors.bind_lifecycle(**_make_stub_lifecycle(
+            ga_idle_timeout_secs=300.0,
+            mint_cookie=self._mint_cookie,
+        ))
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        # Should have attempted at least 2 spawn calls (original + retry)
+        self.assertGreaterEqual(responses["calls"], 2)
+
+    def test_spawn_401_mint_cookie_returns_none_fail_open(self):
+        """/api/spawn returns 401 AND _mint_cookie returns None → fail-open, no stop."""
+        self._http.script("/api/spawn", _MockResponse(401))
+        self._mint_cookie.return_value = None
+        monitors.bind_lifecycle(**_make_stub_lifecycle(
+            ga_idle_timeout_secs=300.0,
+            mint_cookie=self._mint_cookie,
+        ))
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_crons_401_mint_cookie_succeeds_retries(self):
+        """/api/crons returns 401 AND _mint_cookie returns new cookie → request retried."""
+        responses = {"cron_calls": 0}
+
+        def patched_get(url, **kwargs):
+            if "/api/crons" in url:
+                responses["cron_calls"] += 1
+                if responses["cron_calls"] == 1:
+                    return _MockResponse(401)
+                return _MockResponse(200, {"jobs": []})
+            # spawn: no active tasks
+            return _MockResponse(200, {"agents": []})
+
+        self._http.get = patched_get
+        self._mint_cookie.return_value = "new-cookie-value"
+        monitors.bind_lifecycle(**_make_stub_lifecycle(
+            ga_idle_timeout_secs=300.0,
+            mint_cookie=self._mint_cookie,
+        ))
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        self.assertGreaterEqual(responses["cron_calls"], 2)
+
+    def test_crons_401_mint_cookie_returns_none_fail_open(self):
+        """/api/crons returns 401 AND _mint_cookie returns None → fail-open, no stop."""
+        self._http.script("/api/crons", _MockResponse(401))
+        self._mint_cookie.return_value = None
+        monitors.bind_lifecycle(**_make_stub_lifecycle(
+            ga_idle_timeout_secs=300.0,
+            mint_cookie=self._mint_cookie,
+        ))
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry()})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_captain_schedule_hold_not_stopped(self):
+        """Registry entry has captain-type schedule enabled + next_fire_at < _NEVER_FIRE_AT → no stop, _touch_crew called."""
+        captain_sched = {
+            "type": "captain",
+            "enabled": True,
+            "next_fire_at": self.NOW + 60,  # real schedule, not _NEVER_FIRE_AT
+        }
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[captain_sched])})
+        self.assertFalse(self._podman.was_called("container_stop"))
+        self._mock_touch.assert_called_with(self.CREW_ID)
+
+    def test_toctou_guard_prevents_stop(self):
+        """TOCTOU guard: if last_used < GA_IDLE_TIMEOUT_SECS from now inside the lock → container_stop not called."""
+        # Set last_used to right at NOW so idle_secs == 0 < 300
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(last_used=self.NOW)})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_toctou_inlock_guard_prevents_stop(self):
+        """In-lock TOCTOU re-check: last_used advanced to now between the early check and the lock.
+
+        The idle monitor performs an early-out check (idle_secs < GA_IDLE_TIMEOUT_SECS)
+        before HTTP calls.  A separate, in-lock re-check at the stop gate (line 547 of
+        monitors.py) re-reads last_used from the registry under the lock so that a
+        concurrent _touch_crew that lands during the HTTP-check window is honoured.
+
+        This test simulates that race: the first _load_registry call (crew_items
+        snapshot) returns an entry with last_used far in the past (passes the
+        early-out); the second _load_registry call (inside the TOCTOU lock block)
+        returns an entry with last_used == NOW (fresh touch just arrived).
+        container_stop must NOT be called.
+        """
+        old_entry = self._make_crew_entry()          # last_used = NOW - 400, passes early-out
+        refreshed_entry = self._make_crew_entry(last_used=self.NOW)  # touched during checks
+
+        call_count = [0]
+        old_reg = _make_reg({self.CREW_ID: old_entry})
+        refreshed_reg = _make_reg({self.CREW_ID: refreshed_entry})
+
+        def scripted_load():
+            call_count[0] += 1
+            # First call: crew_items snapshot (passes early idle check)
+            if call_count[0] == 1:
+                return old_reg
+            # Subsequent calls (TOCTOU lock block + write-back): refreshed last_used
+            return refreshed_reg
+
+        with patch.object(monitors.time, "sleep", side_effect=[None, StopIteration()]), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(monitors, "_get_podman", return_value=self._podman), \
+             patch.object(monitors, "_http", self._http), \
+             patch.object(monitors, "_touch_crew"), \
+             patch.object(_reg_mod, "_load_registry", side_effect=scripted_load), \
+             patch.object(_reg_mod, "_save_registry"):
+            try:
+                monitors._idle_monitor()
+            except StopIteration:
+                pass
+
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_stopping_flag_prevents_double_stop(self):
+        """_stopping=True pre-set → container_stop not called."""
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(_stopping=True)})
+        self.assertFalse(self._podman.was_called("container_stop"))
+
+    def test_successful_stop_clears_stopping_and_sets_status(self):
+        """After successful container_stop → _stopping removed, status=='stopped'."""
+        entry = self._make_crew_entry()
+        self._run_one_tick({self.CREW_ID: entry})
+        live = self._last_reg["crews"].get(self.CREW_ID, {})
+        self.assertNotIn("_stopping", live)
+        self.assertEqual(live.get("status"), "stopped")
+
+    def test_container_stop_raises_clears_stopping_no_status_change(self):
+        """container_stop raises → _stopping cleared, status NOT changed to 'stopped'."""
+        # Script container_stop to raise
+        original_stop = self._podman.container_stop
+
+        def raising_stop(name):
+            original_stop(name)
+            raise RuntimeError("stop timeout")
+
+        self._podman.container_stop = raising_stop
+
+        entry = self._make_crew_entry(status="running")
+        self._run_one_tick({self.CREW_ID: entry})
+
+        live = self._last_reg["crews"].get(self.CREW_ID, {})
+        self.assertNotIn("_stopping", live)
+        self.assertNotEqual(live.get("status"), "stopped")
+
+
+# ── Task 5.x: TestCaptainMonitorIteration ────────────────────────────────────
+
+
+class TestCaptainMonitorIteration(unittest.TestCase):
+    """_captain_monitor iteration: single-tick body logic."""
+
+    CREW_ID = "crew-cap"
+    CONTAINER = "gs-crew-cap"
+    NOW = 3000.0
+
+    def _make_crew_entry(self, schedules=None, **kwargs):
+        entry = {
+            "container": self.CONTAINER,
+            "cookie": "tok",
+            "status": "running",
+            "last_used": self.NOW - 100,
+        }
+        entry.update(kwargs)
+        entry["schedules"] = schedules if schedules is not None else []
+        return entry
+
+    def _make_captain_sched(self, **kwargs):
+        base = {
+            "type": "captain",
+            "enabled": True,
+            "next_fire_at": self.NOW - 5,
+            "interval_secs": 3600,
+        }
+        base.update(kwargs)
+        return base
+
+    def setUp(self):
+        stubs = _make_stub_lifecycle()
+        self._ensure = stubs["ensure_crew_running"]
+        monitors.bind_lifecycle(**stubs)
+
+        # TRN-242: _steer_captain_checkin / _dispatch_captain_checkin are now
+        # imported at monitors module top from captain_engine (no longer a
+        # call-time import from server), so patch them on the monitors module.
+        self._fake_steer = MagicMock()
+        self._orig_steer = monitors._steer_captain_checkin
+        self._orig_dispatch = monitors._dispatch_captain_checkin
+        monitors._steer_captain_checkin = self._fake_steer
+        monitors._dispatch_captain_checkin = MagicMock()
+
+        # FakePodmanClient (no sentinel by default)
+        self._podman = FakePodmanClient()
+        self._podman.add_container(self.CONTAINER, running=True)
+
         monitors._idle_skip_reasons.clear()
-        with self.assertLogs(monitors.logger, level="INFO") as logs:
-            monitors._note_idle_skip("a", "cron job enabled or recently ran")
-            monitors._note_idle_skip("a", "cron job enabled or recently ran")
-            monitors._note_idle_skip("a", "tasks running")
-        kept = [m for m in logs.output if "kept running" in m]
-        self.assertEqual(len(kept), 2)
+
+    def tearDown(self):
+        monitors._steer_captain_checkin = self._orig_steer
+        monitors._dispatch_captain_checkin = self._orig_dispatch
+        monitors._idle_skip_reasons.clear()
+
+    def _run_one_tick(self, crews):
+        """Run exactly one captain-monitor body iteration."""
+        reg = _make_reg(crews)
+        call_count = [0]
+
+        def fake_sleep(n):
+            call_count[0] += 1
+            if call_count[0] >= 1:
+                raise StopIteration
+
+        with patch.object(monitors.time, "sleep", side_effect=fake_sleep), \
+             patch.object(monitors.time, "time", return_value=self.NOW), \
+             patch.object(monitors, "_get_podman", return_value=self._podman), \
+             patch.object(_reg_mod, "_load_registry", return_value=reg), \
+             patch.object(_reg_mod, "_save_registry"):
+            self._last_reg = reg
+            try:
+                monitors._captain_monitor()
+            except StopIteration:
+                pass
+
+    def test_due_entry_calls_steer_captain_checkin(self):
+        """Due captain entry, no sentinel → _steer_captain_checkin called, next_fire_at advanced."""
+        sched = self._make_captain_sched()
+        old_nfa = sched["next_fire_at"]
+        crews = {self.CREW_ID: self._make_crew_entry(schedules=[sched])}
+        self._run_one_tick(crews)
+        self._fake_steer.assert_called()
+        live_scheds = self._last_reg["crews"].get(self.CREW_ID, {}).get("schedules", [])
+        live_sched = next((s for s in live_scheds if s.get("type") == "captain"), sched)
+        self.assertGreater(live_sched["next_fire_at"], old_nfa)
+
+    def test_not_yet_due_not_called(self):
+        """next_fire_at in future → _steer_captain_checkin not called."""
+        sched = self._make_captain_sched(next_fire_at=self.NOW + 9999)
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._fake_steer.assert_not_called()
+
+    def test_disabled_entry_skipped(self):
+        """enabled=False → _steer_captain_checkin not called."""
+        sched = self._make_captain_sched(enabled=False)
+        self._run_one_tick({self.CREW_ID: self._make_crew_entry(schedules=[sched])})
+        self._fake_steer.assert_not_called()
+
+    def test_sentinel_auto_pause(self):
+        """Sentinel present → schedule entry enabled=False, _steer_captain_checkin not called."""
+        SENTINEL_PATH = "/home/kirocrew/workplace/kirocrew-workspace/.captain_done"
+        self._podman.set_archive_file(
+            self.CONTAINER,
+            SENTINEL_PATH,
+            b"captain_id=crew-cap\ncompleted_at=2026-10-15T00:00:00Z\n",
+            filename=".captain_done",
+        )
+        sched = self._make_captain_sched()
+        crews = {self.CREW_ID: self._make_crew_entry(schedules=[sched])}
+        self._run_one_tick(crews)
+        self._fake_steer.assert_not_called()
+        # Schedule should be disabled in the registry dict
+        live_scheds = self._last_reg["crews"].get(self.CREW_ID, {}).get("schedules", [])
+        cap_sched = next((s for s in live_scheds if s.get("type") == "captain"), None)
+        self.assertIsNotNone(cap_sched)
+        self.assertFalse(cap_sched.get("enabled", True))
+
+    def test_ensure_crew_running_raises_advances_next_fire_at(self):
+        """_ensure_crew_running raises → next_fire_at advanced, _steer_captain_checkin not called."""
+        self._ensure.side_effect = RuntimeError("container dead")
+        sched = self._make_captain_sched()
+        old_nfa = sched["next_fire_at"]
+        crews = {self.CREW_ID: self._make_crew_entry(schedules=[sched])}
+        self._run_one_tick(crews)
+        self._fake_steer.assert_not_called()
+        live_scheds = self._last_reg["crews"].get(self.CREW_ID, {}).get("schedules", [])
+        live_sched = next((s for s in live_scheds if s.get("type") == "captain"), sched)
+        self.assertGreater(live_sched["next_fire_at"], old_nfa)
+
+
+# ── Task 6.1: Integration check (regression guard) ────────────────────────────
+
+
+class TestNoRegressions(unittest.TestCase):
+    """Smoke test: confirm all helper functions are importable and functional."""
+
+    def test_cron_activity_since_basic(self):
+        self.assertTrue(monitors._cron_activity_since({"jobs": [{"is_running": True}]}, 0.0))
+        self.assertFalse(monitors._cron_activity_since({"jobs": []}, 0.0))
+
+    def test_cron_has_enabled_job_basic(self):
+        self.assertTrue(monitors._cron_has_enabled_job({"jobs": [{"enabled": True}]}))
+        self.assertFalse(monitors._cron_has_enabled_job({"jobs": []}))
+
+    def test_bind_lifecycle_callable(self):
+        stubs = _make_stub_lifecycle()
+        monitors.bind_lifecycle(**stubs)
+        self.assertIs(monitors._ensure_crew_running, stubs["ensure_crew_running"])
+
+
+if __name__ == "__main__":
+    unittest.main()

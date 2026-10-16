@@ -240,8 +240,8 @@ class Config:
     # Upstream base image used for ephemeral containers that only need kiro-cli
     # (e.g. login containers). Must match the FROM pin in
     # crews/_base/admission/Containerfile.
-    # TRN-219: pinned to the immutable digest of 0.9.0-insider.4.
-    kc_base_image: str = "ghcr.io/kirodotdev/kirocrew@sha256:f4f4801898572175a1988e61a8696769821528860edceaf5ca253f8123a77009"
+    # 2026-10-17: bumped insider.4 → v0.9.0 stable. Schema verified unchanged.
+    kc_base_image: str = "ghcr.io/kirodotdev/kirocrew@sha256:a6156d268507cae747a6004bcc37a394c6a9955c9426eb2852e8f515b94821ec"
 
     # ── Crew lifecycle ───────────────────────────────────────────────────────
     ga_max_crews: int = 20
@@ -355,6 +355,28 @@ class Config:
     # It is NOT part of the Config dataclass — keeping it out of Config avoids
     # accidental logging or serialisation of the plaintext secret value.
 
+    # ── Fields whose values must never appear in logs or repr ────────────────
+    # SEC-3: non-empty values of these fields are masked by __repr__ so that any
+    # log call including repr(cfg)/str(cfg) emits "***" instead of a live
+    # credential.
+    _SECRET_FIELDS = (
+        "kiro_api_key",
+        "anthropic_api_key",
+        "openai_api_key",
+        "claude_code_oauth_token",
+    )
+
+    def __repr__(self) -> str:
+        import dataclasses as _dc
+
+        parts = []
+        for f in _dc.fields(self):
+            value = getattr(self, f.name)
+            if f.name in self._SECRET_FIELDS and value:
+                value = "***"
+            parts.append(f"{f.name}={value!r}")
+        return f"{type(self).__name__}({', '.join(parts)})"
+
     @classmethod
     def from_env(cls) -> "Config":
         """Read every configured env var and construct a Config instance.
@@ -377,7 +399,7 @@ class Config:
                 "PODMAN_SOCKET", "/run/user/1000/podman/podman.sock"
             ),
             kc_image=os.environ.get("KC_IMAGE", "localhost/spec-ops:latest"),
-            kc_base_image=os.environ.get("KC_BASE_IMAGE", "ghcr.io/kirodotdev/kirocrew@sha256:f4f4801898572175a1988e61a8696769821528860edceaf5ca253f8123a77009"),
+            kc_base_image=os.environ.get("KC_BASE_IMAGE", "ghcr.io/kirodotdev/kirocrew@sha256:a6156d268507cae747a6004bcc37a394c6a9955c9426eb2852e8f515b94821ec"),
             ga_max_crews=_env_int("GA_MAX_CREWS", "20"),
             ga_max_active_crews=_env_int("GA_MAX_ACTIVE_CREWS", "3"),
             ga_idle_timeout_secs=_env_int("GA_IDLE_TIMEOUT_SECS", "300"),
