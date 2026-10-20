@@ -5,11 +5,11 @@ Usage:
     ghostship <subcommand> [flags]
 
 Subcommands:
-    install    [flags]   Install or update the transport (runs scripts/install.sh)
-    start      [flags]   Start the transport (runs scripts/start.sh)
+    install    [flags]   Install or update the transport (runs bin/install.sh)
+    start      [flags]   Start the transport (runs bin/start.sh)
     stop                 Stop the transport, portal, and Podman machine/service
-    upgrade    [flags]   Rebuild and restart the transport (runs scripts/install.sh)
-    uninstall  [flags]   Uninstall the transport (runs scripts/uninstall.sh)
+    upgrade    [flags]   Rebuild and restart the transport (runs bin/install.sh); --skills also refreshes skills
+    uninstall  [flags]   Uninstall the transport (runs bin/uninstall.sh)
     status               Show transport status (container running, port, uptime)
     setup      [flags]   Register the MCP server and install skill symlinks for agent clients
     version              Print the ghostship version
@@ -46,7 +46,7 @@ def _version() -> str:
 
 
 def _exec_script(script_rel: str, extra_args: list) -> None:
-    """Replace the current process with scripts/<script> forwarding all args."""
+    """Replace the current process with bin/<script> (or scripts/ for dev tools) forwarding all args."""
     script = _ghostship_dir() / script_rel
     if not script.exists():
         print(f"error: script not found: {script}", file=sys.stderr)
@@ -71,40 +71,58 @@ def cmd_install(args: list) -> int:
     if "--help" in args or "-h" in args:
         print("Usage: ghostship install [flags]\n"
               "\nInstall or update the Ghost Academy transport.\n"
-              "Delegates to scripts/install.sh — run 'ghostship install --help' "
+              "Delegates to bin/install.sh — run 'ghostship install --help' "
               "after removing this flag to see all install.sh flags.")
         return 0
-    # Forward ALL extra args unchanged to scripts/install.sh, including
+    # Forward ALL extra args unchanged to bin/install.sh, including
     # --client-only / --url / --api-key (TRN-115) — no per-flag handling here.
-    _exec_script("scripts/install.sh", args)
+    _exec_script("bin/install.sh", args)
 
 
 def cmd_start(args: list) -> int:
     if "--help" in args or "-h" in args:
         print("Usage: ghostship start [flags]\n"
               "\nStart the transport (no-op if already running).\n"
-              "Delegates to scripts/start.sh.")
+              "Delegates to bin/start.sh.")
         return 0
-    _exec_script("scripts/start.sh", args)
+    _exec_script("bin/start.sh", args)
 
 
 def cmd_upgrade(args: list) -> int:
     """Rebuild images and restart the transport (alias for install)."""
     if "--help" in args or "-h" in args:
-        print("Usage: ghostship upgrade [flags]\n"
+        print("Usage: ghostship upgrade [--skills] [flags]\n"
               "\nRebuild images and recreate the transport container.\n"
-              "Equivalent to 'ghostship install'. Delegates to scripts/install.sh.")
+              "Equivalent to 'ghostship install'. Delegates to bin/install.sh.\n"
+              "\n"
+              "  --skills   After a successful rebuild, also run 'ghostship setup' to\n"
+              "             refresh skill symlinks and re-register the MCP server for\n"
+              "             all detected agent clients (kiro-cli, Claude Code, opencode).")
         return 0
-    _exec_script("scripts/install.sh", args)
+    skills = "--skills" in args
+    install_args = [a for a in args if a != "--skills"]
+    if not skills:
+        # Fast path: replace the process entirely (original behaviour).
+        _exec_script("bin/install.sh", install_args)
+        return 0  # unreachable in production (execvp), needed for tests
+    # --skills path: run install as a subprocess so we can chain setup after.
+    script = _ghostship_dir() / "scripts" / "install.sh"
+    if not script.exists():
+        print(f"error: script not found: {script}", file=sys.stderr)
+        return 1
+    result = subprocess.run([str(script)] + install_args)
+    if result.returncode != 0:
+        return result.returncode
+    return cmd_setup([])
 
 
 def cmd_uninstall(args: list) -> int:
     if "--help" in args or "-h" in args:
         print("Usage: ghostship uninstall [flags]\n"
               "\nTear down the Ghost Academy transport.\n"
-              "Delegates to scripts/uninstall.sh.")
+              "Delegates to bin/uninstall.sh.")
         return 0
-    _exec_script("scripts/uninstall.sh", args)
+    _exec_script("bin/uninstall.sh", args)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +165,7 @@ def _podman_cmd() -> list:
 def _stop_machine(machine: str) -> None:
     """Stop the underlying Podman machine (macOS) or dedicated service (Linux).
 
-    Mirrors the start-side logic in scripts/start.sh. A machine that is already
+    Mirrors the start-side logic in bin/start.sh. A machine that is already
     stopped or not found is reported, never raised — a non-zero return from the
     stop command in that case is expected and must not fail `ghostship stop`.
 
@@ -276,6 +294,17 @@ def cmd_status(args: list) -> int:
     )
 
     if inspect.returncode != 0:
+        stderr_lower = (inspect.stderr or "").lower()
+        # A connection error means the Podman machine/service is stopped but
+        # the install is intact — distinguish from a missing container.
+        machine_stopped = any(k in stderr_lower for k in (
+            "connection refused", "no such file", "cannot connect",
+            "failed to connect", "dial unix", "machine is not running",
+        ))
+        if machine_stopped:
+            print("ghostship status: stopped (podman machine not running)")
+            print("  Run 'ghostship start' to bring it back up.")
+            return 0
         # Container doesn't exist at all
         print("ghostship status: not installed (ga-transport container not found)")
         print("  Run 'ghostship install' to set up the transport.")
@@ -401,56 +430,161 @@ def cmd_setup(args: list) -> int:
             "  --api-key Bearer token for the MCP endpoint (optional)\n"
         )
         return 0
-    _exec_script("scripts/setup.py", args)
-
-
-
+    _exec_script("bin/setup.py", args)
 
 # ---------------------------------------------------------------------------
-# Subcommand group: auth
+# Subcommand group: auth  (TRN-233)
 # ---------------------------------------------------------------------------
 
 _AUTH_POLL_INTERVAL = 5      # seconds between GET /login polls
 _AUTH_TIMEOUT = 300          # total seconds before the flow times out
 
+_VALID_BACKENDS = ("kiro", "claude", "codex")
 
-def _resolve_transport_url(args: list) -> str:
-    """Resolve the transport base URL.
+# Per-backend method list (method name → transport path suffix)
+_BACKEND_METHODS = {
+    "kiro": [
+        ("api-key", "Paste API key"),
+        ("builder-id", "Device code with Builder ID (social login)"),
+        ("identity-center", "Device code with IAM Identity Center (enterprise)"),
+    ],
+    "claude": [
+        ("oauth", "Authorisation code (browser login)"),
+        ("api-key", "Paste API key"),
+        ("setup-token", "Paste setup-token"),
+    ],
+    "codex": [
+        ("chatgpt", "ChatGPT subscription (device code — must be enabled in account security settings)"),
+        ("api-key", "Paste API key"),
+    ],
+}
 
-    Resolution order: --url flag > GHOSTSHIP_URL env var >
-    http://localhost:64057. Trailing slash is stripped.
+# Methods that accept a pasted secret (vs. starting an interactive flow)
+_PASTE_METHODS = frozenset(["api-key", "setup-token"])
+
+# Methods that start a device-code or authorisation-code flow
+_FLOW_METHODS = frozenset(["builder-id", "identity-center", "chatgpt", "oauth"])
+
+
+def _discover_transport(args: list) -> tuple[str, str | None]:
+    """Return (base_url, api_key) via the full discovery chain.
+
+    Order: flag → env → Podman inspect → default.
     """
+    # URL: flag > GHOSTSHIP_URL env > Podman inspect > default
     url = None
     if "--url" in args:
         idx = args.index("--url")
         if idx + 1 < len(args):
             url = args[idx + 1]
     if not url:
-        url = os.environ.get("GHOSTSHIP_URL") or "http://localhost:64057"
-    return url.rstrip("/")
+        url = os.environ.get("GHOSTSHIP_URL") or ""
+    if not url:
+        url = _inspect_installed_url() or ""
+    if not url:
+        url = "http://localhost:64057"
+    url = url.rstrip("/")
 
-
-def _parse_api_key(args: list):
-    """Return the value following --api-key, or None if absent."""
+    # API key: flag > GHOSTSHIP_API_KEY env > Podman inspect data dir
+    api_key = None
     if "--api-key" in args:
         idx = args.index("--api-key")
         if idx + 1 < len(args):
-            return args[idx + 1]
+            api_key = args[idx + 1]
+    if not api_key:
+        api_key = os.environ.get("GHOSTSHIP_API_KEY") or None
+    if not api_key:
+        api_key = _inspect_installed_api_key() or None
+
+    return url, api_key
+
+
+def _inspect_installed_url() -> str:
+    """Try to discover the installed transport URL via Podman inspect.
+
+    ga-transport publishes no host port — clients reach it through ga-portal —
+    so its port bindings say nothing. install.sh bakes the public URL into
+    ga-transport's GA_HOST_URL (derived from HOST and PORT unless --public-url
+    overrides it), which is exactly the base URL a client should use.
+    """
+    podman = _find_podman()
+    if not podman:
+        return ""
+    try:
+        result = subprocess.run(
+            podman + ["inspect", "ga-transport", "--format", "{{json .Config.Env}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        for item in json.loads(result.stdout.strip()) or []:
+            if isinstance(item, str) and item.startswith("GA_HOST_URL="):
+                return item.split("=", 1)[1].strip().rstrip("/")
+    except Exception:
+        pass
+    return ""
+
+
+def _inspect_installed_api_key() -> str:
+    """Try to read ga-api-key from the transport's /data mount via Podman inspect."""
+    podman = _find_podman()
+    if not podman:
+        return ""
+    try:
+        result = subprocess.run(
+            podman + ["inspect", "ga-transport", "--format", "{{json .Mounts}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        mounts = json.loads(result.stdout.strip())
+        for mount in mounts:
+            if mount.get("Destination") == "/data":
+                src = mount.get("Source", "")
+                key_path = pathlib.Path(src) / "ga-api-key"
+                try:
+                    return key_path.read_text().strip()
+                except (OSError, PermissionError):
+                    pass
+    except Exception:
+        pass
+    return ""
+
+
+def _find_podman() -> list | None:
+    """Return the podman command list, or None if podman is not available."""
+    for cmd in (["podman"], ["podman-remote"]):
+        if shutil.which(cmd[0]):
+            return cmd
     return None
 
 
+def _is_safe_url(url: str) -> bool:
+    """Return True if url is https:// or targets a loopback host."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    hostname = parsed.hostname or ""
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+    # 127.x.x.x range
+    if hostname.startswith("127."):
+        return True
+    return False
+
+
+def _read_secret(prompt: str) -> str:
+    """Read a secret from a hidden prompt (tty) or stdin (piped)."""
+    import getpass
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    else:
+        return sys.stdin.read().strip()
+
+
 def _http_json(url: str, method: str, body=None, api_key=None):
-    """Perform an HTTP request and return the parsed JSON response.
-
-    Sends a JSON body when *body* is provided.
-
-    Raises:
-        urllib.error.HTTPError  — on an HTTP error response (4xx/5xx).
-                                  Callers can read .code and .read() for the
-                                  body before falling through to URLError.
-        urllib.error.URLError   — on a connection failure (network unreachable,
-                                  refused, timeout).
-    """
+    """Perform an HTTP request and return the parsed JSON response."""
     data = None
     headers = {"Accept": "application/json"}
     if body is not None:
@@ -466,63 +600,17 @@ def _http_json(url: str, method: str, body=None, api_key=None):
     return json.loads(raw)
 
 
-def auth_login(args: list) -> int:
-    url = _resolve_transport_url(args)
-    api_key = _parse_api_key(args)
-    login_url = f"{url}/login"
-
-    # Initiate the device auth flow.
-    try:
-        resp = _http_json(login_url, "POST", body={}, api_key=api_key)
-    except urllib.error.HTTPError as exc:
-        # The transport responded with an HTTP error — surface the server
-        # message rather than the generic HTTP reason phrase.
-        try:
-            body = exc.read().decode("utf-8", errors="replace").strip()
-        except Exception:
-            body = exc.reason
-        # The transport signals "already authenticated" as a 409 with a
-        # plain-text body (not the {"status": "complete"} JSON shape the
-        # check below expects) — treat it as a no-op success so this
-        # command is idempotent, rather than surfacing it as an error.
-        if exc.code == 409 and "already authenticated" in body.lower():
-            print("Already authenticated.")
-            return 0
-        print(f"error: transport returned HTTP {exc.code}: {body}",
-              file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach transport at {url} — {exc.reason}",
-              file=sys.stderr)
-        return 1
-
-    # Transport may report auth is already established.
-    if resp.get("status") == "complete" or resp.get("already_authenticated"):
-        print("Already authenticated.")
-        return 0
-
-    activation_url = resp.get("login_url") or resp.get("verification_url") or ""
-    user_code = resp.get("user_code") or resp.get("code") or ""
-
-    print("To authenticate, open the following URL and enter the code:")
-    if activation_url:
-        print(f"  URL:  {activation_url}")
-    if user_code:
-        print(f"  Code: {user_code}")
-    print("Waiting for you to complete authentication", end="", flush=True)
-
-    # Poll GET /login until complete or the client-side timeout fires.
-    # The server returns {status: "pending"} while the flow is active and
-    # {status: "complete"} when the user finishes authentication.  A 404
-    # ("No login in progress") means the flow was lost server-side (restart,
-    # external nuke) — report that distinctly rather than "lost connection".
+def _poll_flow(base_url: str, backend: str, api_key: str | None,
+               login_url: str, code: str) -> int:
+    """Poll GET /login/{backend} until the flow completes. Return 0 on success."""
     elapsed = 0
+    poll_url = f"{base_url}/login/{backend}"
     while elapsed < _AUTH_TIMEOUT:
         time.sleep(_AUTH_POLL_INTERVAL)
         elapsed += _AUTH_POLL_INTERVAL
         print(".", end="", flush=True)
         try:
-            poll = _http_json(login_url, "GET", api_key=api_key)
+            poll = _http_json(poll_url, "GET", api_key=api_key)
         except urllib.error.HTTPError as exc:
             print()
             try:
@@ -534,7 +622,7 @@ def auth_login(args: list) -> int:
             return 1
         except urllib.error.URLError as exc:
             print()
-            print(f"error: lost connection to transport at {url} — {exc.reason}",
+            print(f"error: lost connection to transport — {exc.reason}",
                   file=sys.stderr)
             return 1
         status = poll.get("status")
@@ -542,20 +630,286 @@ def auth_login(args: list) -> int:
             print()
             print("Authenticated successfully.")
             return 0
-
     print()
     print("error: authentication timed out before completion.", file=sys.stderr)
-    if activation_url:
-        print(f"  Retry at: {activation_url}", file=sys.stderr)
+    if login_url:
+        print(f"  Retry at: {login_url}", file=sys.stderr)
     return 1
 
 
-def auth_logout(args: list) -> int:
-    url = _resolve_transport_url(args)
-    api_key = _parse_api_key(args)
-    logout_url = f"{url}/logout"
+def auth_login(args: list) -> int:
+    """ghostship auth login <backend> [--method <m>] [--yes] [--insecure]
+    [--identity-provider <url>] [--region <r>]"""
+    # Parse backend
+    positional = [a for a in args if not a.startswith("-")]
+    if not positional:
+        print("error: backend required (kiro, claude, codex)", file=sys.stderr)
+        print(_AUTH_USAGE, end="", file=sys.stderr)
+        return 1
+    backend = positional[0]
+    if backend not in _VALID_BACKENDS:
+        print(f"error: unknown backend '{backend}'. Valid backends: {', '.join(_VALID_BACKENDS)}",
+              file=sys.stderr)
+        return 1
+
+    base_url, api_key = _discover_transport(args)
+
+    # Parse flags
+    method = None
+    if "--method" in args:
+        idx = args.index("--method")
+        if idx + 1 < len(args):
+            method = args[idx + 1]
+    yes = "--yes" in args
+    insecure = "--insecure" in args
+    identity_provider = None
+    if "--identity-provider" in args:
+        idx = args.index("--identity-provider")
+        if idx + 1 < len(args):
+            identity_provider = args[idx + 1]
+    if not identity_provider:
+        identity_provider = os.environ.get("KIRO_IDENTITY_PROVIDER") or None
+    region = None
+    if "--region" in args:
+        idx = args.index("--region")
+        if idx + 1 < len(args):
+            region = args[idx + 1]
+    if not region:
+        region = os.environ.get("KIRO_REGION") or None
+
+    # For kiro identity-center, fetch defaults from transport config if not set.
+    if backend == "kiro" and (not identity_provider or not region):
+        try:
+            _status = _http_json(f"{base_url}/login/kiro", "GET", api_key=api_key)
+            _ic = _status.get("identity_center") or {}
+            if not identity_provider:
+                identity_provider = _ic.get("start_url") or None
+            if not region:
+                region = _ic.get("region") or None
+        except Exception:
+            pass  # non-fatal — will prompt if still missing
+
+    # Method validation
+    valid_methods = [m for m, _ in _BACKEND_METHODS[backend]]
+    if method and method not in valid_methods:
+        print(f"error: unknown method '{method}' for {backend}. "
+              f"Valid methods: {', '.join(valid_methods)}", file=sys.stderr)
+        return 1
+
+    # Method menu if no --method and on a tty
+    if not method:
+        if not sys.stdin.isatty():
+            print(f"error: --method is required when stdin is not a terminal. "
+                  f"Valid methods: {', '.join(valid_methods)}", file=sys.stderr)
+            return 1
+        methods = _BACKEND_METHODS[backend]
+        print(f"\nAvailable methods for {backend}:")
+        for i, (m_name, m_desc) in enumerate(methods, 1):
+            print(f"  {i}. {m_desc}")
+        try:
+            choice = input(f"Choose [1-{len(methods)}]: ").strip()
+            idx = int(choice) - 1
+            if not (0 <= idx < len(methods)):
+                raise ValueError
+            method = methods[idx][0]
+        except (ValueError, KeyboardInterrupt, EOFError):
+            print("\nerror: invalid choice", file=sys.stderr)
+            return 1
+
+    # Check current credential state and warn if replacing
     try:
-        _http_json(logout_url, "POST", body={}, api_key=api_key)
+        status_resp = _http_json(f"{base_url}/login/{backend}", "GET", api_key=api_key)
+        if status_resp.get("configured"):
+            current_method = status_resp.get("method", "unknown")
+            if not yes:
+                if not sys.stdin.isatty():
+                    print(f"error: {backend} already has a stored credential "
+                          f"(method={current_method}). Use --yes to replace it.",
+                          file=sys.stderr)
+                    return 1
+                try:
+                    confirm = input(
+                        f"{backend} already has a credential (method={current_method}). "
+                        f"Replace it? [y/N] "
+                    ).strip().lower()
+                    if confirm not in ("y", "yes"):
+                        print("Aborted. Existing credential unchanged.")
+                        return 0
+                except (KeyboardInterrupt, EOFError):
+                    print("\nAborted.")
+                    return 0
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        # If we can't reach the transport, we'll catch the error properly below
+        pass
+
+    # Paste secret methods
+    if method in _PASTE_METHODS:
+        # HTTPS or loopback check
+        if not insecure and not _is_safe_url(base_url):
+            print(
+                f"error: refusing to send a secret over plain HTTP to a remote host "
+                f"({base_url}). Use https:// or --insecure.",
+                file=sys.stderr,
+            )
+            return 1
+        # Read secret
+        prompt = f"Enter {backend} {method}: "
+        secret = _read_secret(prompt)
+        if not secret:
+            print("error: empty secret — nothing stored.", file=sys.stderr)
+            return 1
+        # POST to the transport
+        try:
+            resp = _http_json(
+                f"{base_url}/login/{backend}/{method}", "POST",
+                body={"secret": secret}, api_key=api_key,
+            )
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                body = exc.reason
+            print(f"error: transport returned HTTP {exc.code}: {body}",
+                  file=sys.stderr)
+            return 1
+        except urllib.error.URLError as exc:
+            print(f"error: could not reach transport at {base_url} — {exc.reason}",
+                  file=sys.stderr)
+            return 1
+        stored_method = resp.get("method", method)
+        print(f"Stored {backend} credential ({stored_method}).")
+        return 0
+
+    # Flow methods (device code, oauth, etc.)
+    request_body: dict = {}
+    if method == "identity-center":
+        # Collect start_url and region — show config value as default, allow override.
+        if not sys.stdin.isatty():
+            # Non-interactive: require values via flag or env.
+            if not identity_provider:
+                print("error: --identity-provider is required for identity-center "
+                      "when stdin is not a terminal.", file=sys.stderr)
+                return 1
+            if not region:
+                print("error: --region is required for identity-center "
+                      "when stdin is not a terminal.", file=sys.stderr)
+                return 1
+        else:
+            try:
+                _ip_prompt = f"IAM Identity Center start URL [{identity_provider}]: " if identity_provider else "IAM Identity Center start URL: "
+                _ip_input = input(_ip_prompt).strip()
+                if _ip_input:
+                    identity_provider = _ip_input
+                _r_prompt = f"Region [{region}]: " if region else "Region (e.g. us-east-1): "
+                _r_input = input(_r_prompt).strip()
+                if _r_input:
+                    region = _r_input
+            except (KeyboardInterrupt, EOFError):
+                print("\nAborted.")
+                return 1
+        if not identity_provider or not region:
+            print("error: start_url and region are required for identity-center.",
+                  file=sys.stderr)
+            return 1
+        request_body = {"start_url": identity_provider, "region": region}
+    elif method == "chatgpt":
+        print("Note: ChatGPT device code login must be enabled in your ChatGPT "
+              "account or workspace security settings.")
+
+    # POST to start the flow
+    try:
+        resp = _http_json(
+            f"{base_url}/login/{backend}/{method}", "POST",
+            body=request_body, api_key=api_key,
+        )
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = exc.reason
+        if exc.code == 409:
+            print("Login already in progress. Poll GET /login/{} for status.".format(backend))
+            return 0
+        print(f"error: transport returned HTTP {exc.code}: {body}",
+              file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"error: could not reach transport at {base_url} — {exc.reason}",
+              file=sys.stderr)
+        return 1
+
+    login_url = resp.get("login_url") or resp.get("verification_url") or ""
+    user_code = resp.get("user_code") or resp.get("code") or ""
+
+    if method == "oauth":
+        # Claude authorisation-code: prompt for the code after printing the URL
+        print("To authenticate, open the following URL:")
+        if login_url:
+            print(f"  URL:  {login_url}")
+        print("After approving, you will see a code to paste here.")
+        # Check HTTPS or loopback before reading the code
+        if not insecure and not _is_safe_url(base_url):
+            print(
+                f"error: refusing to send an authorisation code over plain HTTP to a "
+                f"remote host ({base_url}). Use https:// or --insecure.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            code = _read_secret("Paste the authorisation code: ")
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            return 1
+        if not code:
+            print("error: empty code — nothing submitted.", file=sys.stderr)
+            return 1
+        # Submit the code
+        try:
+            _http_json(
+                f"{base_url}/login/{backend}/oauth/code", "POST",
+                body={"code": code}, api_key=api_key,
+            )
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                body = exc.reason
+            print(f"error: transport returned HTTP {exc.code}: {body}",
+                  file=sys.stderr)
+            return 1
+        except urllib.error.URLError as exc:
+            print(f"error: lost connection — {exc.reason}", file=sys.stderr)
+            return 1
+        print("Code submitted. Waiting for authentication to complete",
+              end="", flush=True)
+    else:
+        # Device code (builder-id, identity-center, chatgpt)
+        print("To authenticate, open the following URL and enter the code:")
+        if login_url:
+            print(f"  URL:  {login_url}")
+        if user_code:
+            print(f"  Code: {user_code}")
+        print("Waiting for you to complete authentication", end="", flush=True)
+
+    return _poll_flow(base_url, backend, api_key, login_url, user_code)
+
+
+def auth_logout(args: list) -> int:
+    """ghostship auth logout <backend>"""
+    positional = [a for a in args if not a.startswith("-")]
+    if not positional:
+        print("error: backend required (kiro, claude, codex)", file=sys.stderr)
+        print(_AUTH_USAGE, end="", file=sys.stderr)
+        return 1
+    backend = positional[0]
+    if backend not in _VALID_BACKENDS:
+        print(f"error: unknown backend '{backend}'. Valid backends: {', '.join(_VALID_BACKENDS)}",
+              file=sys.stderr)
+        return 1
+
+    base_url, api_key = _discover_transport(args)
+    try:
+        _http_json(f"{base_url}/logout/{backend}", "POST", body={}, api_key=api_key)
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode("utf-8", errors="replace").strip()
@@ -565,27 +919,80 @@ def auth_logout(args: list) -> int:
               file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
-        print(f"error: could not reach transport at {url} — {exc.reason}",
+        print(f"error: could not reach transport at {base_url} — {exc.reason}",
               file=sys.stderr)
         return 1
-    print("Logged out.")
+    print(f"Logged out of {backend}.")
+    return 0
+
+
+def auth_status(args: list) -> int:
+    """ghostship auth status [--json]"""
+    base_url, api_key = _discover_transport(args)
+    use_json = "--json" in args
+
+    results = {}
+    for backend in _VALID_BACKENDS:
+        try:
+            resp = _http_json(f"{base_url}/login/{backend}", "GET", api_key=api_key)
+            results[backend] = resp
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                body = exc.reason
+            print(f"error: transport returned HTTP {exc.code} for {backend}: {body}",
+                  file=sys.stderr)
+            return 1
+        except urllib.error.URLError as exc:
+            print(f"error: could not reach transport at {base_url} — {exc.reason}",
+                  file=sys.stderr)
+            return 1
+
+    if use_json:
+        print(json.dumps(results, indent=2))
+        return 0
+
+    # Table output
+    print(f"{'Backend':<10}  {'Configured':<12}  {'Method':<20}  {'Stored at'}")
+    print("-" * 70)
+    for backend in _VALID_BACKENDS:
+        info = results.get(backend, {})
+        configured = "yes" if info.get("configured") else "no"
+        method = info.get("method") or "not configured"
+        stored_at = info.get("stored_at") or ""
+        # Truncate ISO datetime for readability
+        if stored_at and "T" in stored_at:
+            stored_at = stored_at.split("T")[0]
+        print(f"{backend:<10}  {configured:<12}  {method:<20}  {stored_at}")
     return 0
 
 
 _AUTH_USAGE = """\
-Usage: ghostship auth <login|logout> [flags]
+Usage: ghostship auth <login|logout|status> [backend] [flags]
 
-  login    Start the device auth flow with the transport, print the
-           activation URL + code, and poll until you complete it.
-  logout   Revoke the current transport session.
+  login <backend>    Store or replace a credential for kiro, claude or codex.
+  logout <backend>   Clear the stored credential for kiro, claude or codex.
+  status             Show credential status for all backends.
 
-Flags (both subcommands):
-  --url <transport-url>   Transport base URL
-                          (default: GHOSTSHIP_URL env var, then http://localhost:64057)
-  --api-key <key>         Bearer token for transports that require auth
+Backends: kiro, claude, codex
+
+Flags (all verbs):
+  --url <url>                Transport base URL
+                             (default: GHOSTSHIP_URL env, then Podman inspect,
+                             then http://localhost:64057)
+  --api-key <key>            Bearer token (default: GHOSTSHIP_API_KEY env,
+                             then ga-api-key from the data volume mount)
+
+Flags for login:
+  --method <method>          Skip method menu (methods vary by backend)
+  --yes                      Replace existing credential without confirmation
+  --insecure                 Allow sending secrets over plain HTTP to remote hosts
+  --identity-provider <url>  IAM Identity Center start URL (kiro identity-center)
+  --region <region>          AWS region (kiro identity-center)
 """
 
-_AUTH_COMMANDS = {"login": auth_login, "logout": auth_logout}
+_AUTH_COMMANDS = {"login": auth_login, "logout": auth_logout, "status": auth_status}
 
 
 def cmd_auth(args: list) -> int:
@@ -601,6 +1008,7 @@ def cmd_auth(args: list) -> int:
     return handler(args[1:])
 
 
+
 # ---------------------------------------------------------------------------
 # Usage / dispatch
 # ---------------------------------------------------------------------------
@@ -609,14 +1017,14 @@ _USAGE = """\
 Usage: ghostship <subcommand> [flags]
 
 Subcommands:
-  install    [flags]   Install or update the transport (runs scripts/install.sh)
-  start      [flags]   Start the transport (runs scripts/start.sh)
+  install    [flags]   Install or update the transport (runs bin/install.sh)
+  start      [flags]   Start the transport (runs bin/start.sh)
   stop                 Stop the transport + portal, then the Podman machine/service (frees RAM, preserves state)
-  upgrade    [flags]   Rebuild and restart the transport (same as install)
-  uninstall  [flags]   Uninstall the transport (runs scripts/uninstall.sh)
+  upgrade    [flags]   Rebuild and restart the transport (same as install); --skills also refreshes skill symlinks
+  uninstall  [flags]   Uninstall the transport (runs bin/uninstall.sh)
   status               Show transport status
   setup      [flags]   Register MCP server + skills for agent clients (kiro, Claude Code, opencode)
-  auth       [login|logout]  Authenticate or deauthenticate with the transport
+  auth       [login|logout|status]  Manage backend credentials
   version              Print ghostship version
 
 Run 'ghostship <subcommand> --help' for flags specific to that subcommand.

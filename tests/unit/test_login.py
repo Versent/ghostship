@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 from tests.fakes import FakePodmanClient
 
@@ -300,6 +301,110 @@ class TestNukeContainer(unittest.TestCase):
         self.assertTrue(podman.was_called("container_remove"))
 
 
+class TestKiroLoginCmdLicense(unittest.TestCase):
+    """--license is derived from the login method, never from config."""
+
+    def _cmd_for(self, pending):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        flow._pending = pending
+        return flow._login_cmd()
+
+    def test_identity_center_passes_license_pro_and_provider(self):
+        cmd = self._cmd_for({
+            "method": "identity-center",
+            "provider": {"start_url": "https://d-123.awsapps.com/start/#/", "region": "eu-west-1"},
+        })
+        self.assertEqual(cmd[cmd.index("--license") + 1], "pro")
+        self.assertEqual(
+            cmd[cmd.index("--identity-provider") + 1], "https://d-123.awsapps.com/start/#/"
+        )
+        self.assertEqual(cmd[cmd.index("--region") + 1], "eu-west-1")
+        self.assertIn("--use-device-flow", cmd)
+
+    def test_builder_id_passes_license_free(self):
+        cmd = self._cmd_for({"method": "builder-id", "provider": None})
+        self.assertEqual(cmd[cmd.index("--license") + 1], "free")
+        self.assertNotIn("--identity-provider", cmd)
+        self.assertNotIn("--region", cmd)
+
+    def test_no_pending_defaults_to_builder_id(self):
+        cmd = self._cmd_for(None)
+        self.assertEqual(cmd[cmd.index("--license") + 1], "free")
+
+
+class TestKiroPromptAnswers(unittest.TestCase):
+    """Pre-filled Start URL/Region prompts are accepted with a bare Enter."""
+
+    def test_identity_center_prompts_answer_enter_only(self):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        flow._pending = {
+            "method": "identity-center",
+            "provider": {"start_url": "https://d-123.awsapps.com/start/", "region": "eu-west-1"},
+        }
+        answers = {p.pattern: a for p, a in flow._prompt_patterns()}
+        self.assertEqual(answers["Start URL"], b"\n")
+        self.assertEqual(answers["Region"], b"\n")
+
+    def test_builder_id_has_no_idc_prompts(self):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        flow._pending = {"method": "builder-id", "provider": None}
+        patterns = [p.pattern for p, _ in flow._prompt_patterns()]
+        self.assertNotIn("Start URL", patterns)
+
+
+class TestKiroInitiateResolvesMethod(unittest.TestCase):
+    """KiroLoginFlow.initiate records method/provider in the pending state."""
+
+    def _initiate(self, cfg_kwargs, **kwargs):
+        import transport.login as login_mod
+        from transport.config import Config
+        from transport.login import KiroLoginFlow
+        orig_cfg = login_mod.cfg
+        captured = {}
+
+        class _Flow(KiroLoginFlow):
+            def start_container(self, podman):
+                captured.update(self._pending)
+                raise RuntimeError("stop here")
+
+        try:
+            login_mod.cfg = Config(ga_crew_agent="kiro", **cfg_kwargs)
+            _Flow().initiate(FakePodmanClient(), **kwargs)
+        finally:
+            login_mod.cfg = orig_cfg
+        return captured
+
+    def test_explicit_identity_center_uses_request_provider(self):
+        got = self._initiate(
+            {"kiro_identity_provider": "https://cfg", "kiro_region": "us-east-1"},
+            method="identity-center",
+            provider={"start_url": "https://req", "region": "ap-southeast-2"},
+        )
+        self.assertEqual(got["method"], "identity-center")
+        self.assertEqual(got["provider"], {"start_url": "https://req", "region": "ap-southeast-2"})
+
+    def test_explicit_builder_id_ignores_configured_idc(self):
+        got = self._initiate(
+            {"kiro_identity_provider": "https://cfg", "kiro_region": "us-east-1"},
+            method="builder-id",
+        )
+        self.assertEqual(got["method"], "builder-id")
+        self.assertIsNone(got["provider"])
+
+    def test_default_method_is_identity_center_when_configured(self):
+        got = self._initiate({"kiro_identity_provider": "https://cfg", "kiro_region": "us-east-1"})
+        self.assertEqual(got["method"], "identity-center")
+        self.assertEqual(got["provider"], {"start_url": "https://cfg", "region": "us-east-1"})
+
+    def test_default_method_is_builder_id_when_unconfigured(self):
+        got = self._initiate({})
+        self.assertEqual(got["method"], "builder-id")
+        self.assertIsNone(got["provider"])
+
+
 class TestLoginFlowInitiatePending(unittest.TestCase):
     """LoginFlow.initiate: returns login_pending when already in progress."""
 
@@ -320,6 +425,147 @@ class TestLoginFlowInitiatePending(unittest.TestCase):
         podman = FakePodmanClient()
         flow.initiate(podman)
         self.assertFalse(podman.was_called("container_start"))
+
+
+class TestLoginFlowInitiateCancelledDuringStart(unittest.TestCase):
+    """LoginFlow.initiate: an abort while start_container runs cancels the start."""
+
+    def test_abort_during_start_removes_container_and_cancels(self):
+        from transport.login import KiroLoginFlow
+        podman = FakePodmanClient()
+
+        class _Flow(KiroLoginFlow):
+            def start_container(self, podman):
+                podman.add_container("ga-login-cancelled")
+                self.abort(podman)  # pending has no container yet, so abort only clears it
+                return "ga-login-cancelled"
+
+        flow = _Flow()
+        result = flow.initiate(podman)
+        self.assertEqual(result, {"error": "cancelled"})
+        self.assertFalse(podman.container_exists("ga-login-cancelled"))
+        self.assertIsNone(flow._pending)
+
+    def test_new_flow_started_during_start_is_left_intact(self):
+        from transport.login import KiroLoginFlow
+        podman = FakePodmanClient()
+        new_pending = {"container": None, "state": "starting", "started_at": time.time()}
+
+        class _Flow(KiroLoginFlow):
+            def start_container(self, podman):
+                podman.add_container("ga-login-old")
+                self.abort(podman)
+                # A second caller takes the now-idle slot before the first records anything.
+                self._pending = new_pending
+                return "ga-login-old"
+
+        flow = _Flow()
+        result = flow.initiate(podman)
+        self.assertEqual(result, {"error": "cancelled"})
+        self.assertIs(flow._pending, new_pending)
+        self.assertIsNone(flow._pending["container"])
+        self.assertFalse(podman.container_exists("ga-login-old"))
+
+
+class TestLoginFlowInitiateCancelledDuringPTY(unittest.TestCase):
+    """LoginFlow.initiate: a logout during the PTY URL read must not clear or hand out a newer flow."""
+
+    def _flow(self):
+        from transport.login import KiroLoginFlow
+
+        class _Flow(KiroLoginFlow):
+            def start_container(self, podman):
+                return "ga-login-a"
+
+        return _Flow()
+
+    def _podman(self):
+        podman = mock.Mock()
+        podman.container_exec.return_value = "kiro-cli"
+        podman.container_exec_pty_stdin.return_value = ("exec-a", mock.Mock(), b"")
+        return podman
+
+    def test_failed_pty_read_does_not_clear_a_newer_flow(self):
+        from transport import lifecycle
+        podman = self._podman()
+        flow = self._flow()
+        newer = {"container": "ga-login-b", "state": "started", "started_at": time.time()}
+
+        def pty_read(**kwargs):
+            flow.abort(podman)     # logout cancels flow A
+            flow._pending = newer  # login B takes the idle slot
+            return None, None      # A's container is gone, so no URL
+
+        with mock.patch.object(lifecycle, "_run_pty_login_flow", side_effect=pty_read):
+            result = flow.initiate(podman)
+        self.assertEqual(result, {"error": "cancelled"})
+        self.assertIs(flow._pending, newer)
+
+    def test_url_read_after_cancel_is_not_returned(self):
+        from transport import lifecycle
+        podman = self._podman()
+        flow = self._flow()
+
+        def pty_read(**kwargs):
+            flow.abort(podman)
+            return "https://example.invalid/login", "ABCD-1234"
+
+        with mock.patch.object(lifecycle, "_run_pty_login_flow", side_effect=pty_read):
+            result = flow.initiate(podman)
+        self.assertEqual(result, {"error": "cancelled"})
+        self.assertIsNone(flow._pending)
+        podman.container_remove.assert_called_with("ga-login-a")
+
+
+class TestLoginFlowCommitIfCurrent(unittest.TestCase):
+    """LoginFlow.commit_if_current: store only while the captured flow is still live."""
+
+    def _pending(self):
+        return {"container": "ga-login-c1", "state": "started", "started_at": time.time()}
+
+    def test_current_flow_stores_and_clears(self):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        pending = self._pending()
+        flow._pending = pending
+        stored = []
+        self.assertTrue(flow.commit_if_current(pending, lambda: stored.append("cred")))
+        self.assertEqual(stored, ["cred"])
+        self.assertIsNone(flow._pending)
+
+    def test_cancelled_flow_stores_nothing(self):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        pending = self._pending()
+        flow._pending = pending
+        flow.abort(FakePodmanClient())
+        stored = []
+        self.assertFalse(flow.commit_if_current(pending, lambda: stored.append("cred")))
+        self.assertEqual(stored, [])
+
+    def test_replaced_flow_is_not_committed_and_is_left_intact(self):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        old = self._pending()
+        new = self._pending()
+        flow._pending = new
+        stored = []
+        self.assertFalse(flow.commit_if_current(old, lambda: stored.append("cred")))
+        self.assertEqual(stored, [])
+        self.assertIs(flow._pending, new)
+
+    def test_store_failure_keeps_pending_for_retry(self):
+        from transport.login import KiroLoginFlow
+        flow = KiroLoginFlow()
+        pending = self._pending()
+        flow._pending = pending
+
+        def _boom():
+            raise OSError("disk full")
+
+        with self.assertRaises(OSError):
+            flow.commit_if_current(pending, _boom)
+        self.assertIs(flow._pending, pending)
 
 
 class TestClaudeLoginFlowSubmitCode(unittest.TestCase):
@@ -632,6 +878,156 @@ class TestLoginFlowThreadSafety(unittest.TestCase):
             t.join(timeout=5)
 
         self.assertEqual(errors, [], f"Concurrent abort raised: {errors}")
+
+
+# ── TestWarnInertBackendSettings ──────────────────────────────────────────────
+
+
+class TestWarnInertBackendSettings(unittest.TestCase):
+    """_warn_inert_backend_settings: warns about stored credentials and BASE_URL
+    settings for disabled backends. Values must never appear in log output."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        from transport.credentials import CredentialStore
+        self._store = CredentialStore(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run_warn(self, ga_crew_agent: str) -> list[str]:
+        """Invoke _warn_inert_backend_settings with a patched config and store,
+        returning the list of warning messages emitted."""
+        import logging
+        from transport.login import _warn_inert_backend_settings
+        from transport.config import Config
+        messages = []
+
+        class _CapHandler(logging.Handler):
+            def emit(self, record):
+                messages.append(record.getMessage())
+
+        handler = _CapHandler()
+        import transport.login as login_mod
+        lg = logging.getLogger("transport.login")
+        lg.addHandler(handler)
+        orig_store = login_mod._cred_store
+        orig_cfg = login_mod.cfg
+        try:
+            login_mod._cred_store = self._store
+            login_mod.cfg = Config(ga_crew_agent=ga_crew_agent)
+            _warn_inert_backend_settings()
+        finally:
+            login_mod._cred_store = orig_store
+            login_mod.cfg = orig_cfg
+            lg.removeHandler(handler)
+        return messages
+
+    def test_disabled_backend_with_credential_warns(self):
+        self._store.put("claude", "api-key", "sk-ant-should-not-appear")
+        messages = self._run_warn("kiro")
+        self.assertTrue(
+            any("claude" in m for m in messages),
+            f"Expected warning about disabled claude backend, got: {messages}",
+        )
+
+    def test_warning_contains_method_not_value(self):
+        self._store.put("claude", "setup-token", "my-secret-token-value")
+        messages = self._run_warn("kiro")
+        warning = next((m for m in messages if "claude" in m), None)
+        self.assertIsNotNone(warning, "Expected a warning about claude")
+        # method name is in the warning
+        self.assertIn("setup-token", warning)
+        # secret value is NOT in the warning
+        self.assertNotIn("my-secret-token-value", warning)
+
+    def test_enabled_backend_with_credential_no_warn(self):
+        self._store.put("claude", "api-key", "sk-ant-key-value")
+        messages = self._run_warn("claude,kiro")
+        self.assertFalse(
+            any("claude" in m for m in messages),
+            f"Should not warn about enabled claude backend, got: {messages}",
+        )
+
+    def test_disabled_codex_with_credential_warns(self):
+        self._store.put("codex", "api-key", "sk-openai-test-key")
+        messages = self._run_warn("kiro")
+        self.assertTrue(
+            any("codex" in m for m in messages),
+            f"Expected warning about disabled codex, got: {messages}",
+        )
+
+    def test_no_credential_no_warn(self):
+        # Nothing stored — no warnings
+        messages = self._run_warn("kiro")
+        self.assertEqual(messages, [], f"Expected no warnings but got: {messages}")
+
+    def test_base_url_warns_for_disabled_backend(self):
+        from transport.config import Config
+        import transport.login as login_mod
+        import logging
+        messages = []
+
+        class _CapHandler(logging.Handler):
+            def emit(self, record):
+                messages.append(record.getMessage())
+
+        handler = _CapHandler()
+        lg = logging.getLogger("transport.login")
+        lg.addHandler(handler)
+        orig_store = login_mod._cred_store
+        orig_cfg = login_mod.cfg
+        try:
+            login_mod._cred_store = self._store
+            # anthropic_base_url set but claude not enabled
+            login_mod.cfg = Config(ga_crew_agent="kiro", anthropic_base_url="https://proxy.example.com")
+            from transport.login import _warn_inert_backend_settings
+            _warn_inert_backend_settings()
+        finally:
+            login_mod._cred_store = orig_store
+            login_mod.cfg = orig_cfg
+            lg.removeHandler(handler)
+
+        self.assertTrue(
+            any("ANTHROPIC_BASE_URL" in m for m in messages),
+            f"Expected ANTHROPIC_BASE_URL warning, got: {messages}",
+        )
+        # The URL value itself must not appear in the warning
+        self.assertFalse(
+            any("proxy.example.com" in m for m in messages),
+            f"URL value leaked into warning: {messages}",
+        )
+
+    def test_base_url_not_warned_when_backend_enabled(self):
+        from transport.config import Config
+        import transport.login as login_mod
+        import logging
+        messages = []
+
+        class _CapHandler(logging.Handler):
+            def emit(self, record):
+                messages.append(record.getMessage())
+
+        handler = _CapHandler()
+        lg = logging.getLogger("transport.login")
+        lg.addHandler(handler)
+        orig_store = login_mod._cred_store
+        orig_cfg = login_mod.cfg
+        try:
+            login_mod._cred_store = self._store
+            login_mod.cfg = Config(ga_crew_agent="claude,kiro", anthropic_base_url="https://proxy.example.com")
+            from transport.login import _warn_inert_backend_settings
+            _warn_inert_backend_settings()
+        finally:
+            login_mod._cred_store = orig_store
+            login_mod.cfg = orig_cfg
+            lg.removeHandler(handler)
+
+        self.assertFalse(
+            any("ANTHROPIC_BASE_URL" in m for m in messages),
+            f"Should not warn when claude is enabled, got: {messages}",
+        )
 
 
 if __name__ == "__main__":

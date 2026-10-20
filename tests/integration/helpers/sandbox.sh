@@ -2,8 +2,8 @@
 # Shared sandbox harness for the install/uninstall shell integration tests
 # (trn-212-test-coverage-gaps, design.md D1).
 #
-# These helpers let a test invoke the REAL scripts/install.sh and
-# scripts/uninstall.sh without touching the host system or needing podman:
+# These helpers let a test invoke the REAL bin/install.sh and
+# bin/uninstall.sh without touching the host system or needing podman:
 #
 #   * a tmpdir sandbox with stub `podman` / `podman-compose` / `systemctl` /
 #     `id` binaries placed on PATH ahead of the system copies, so the scripts'
@@ -23,7 +23,7 @@
 #   # shellcheck source=helpers/sandbox.sh
 #   source "$SCRIPT_DIR/helpers/sandbox.sh"
 #   sandbox_setup
-#   sandbox_run_script "$REPO_DIR/scripts/install.sh" --client-only --url http://x
+#   sandbox_run_script "$REPO_DIR/bin/install.sh" --client-only --url http://x
 #   echo "$SANDBOX_STATUS"   # exit code
 #   echo "$SANDBOX_OUTPUT"   # combined stdout+stderr
 
@@ -36,7 +36,7 @@ pass() { PASS=$((PASS + 1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  ✗ $1"; }
 
 # Call at the end of a test file: prints the tally and exits non-zero on any
-# failure, which is what tests/run.sh keys off.
+# failure, which is what scripts/run.sh keys off.
 sandbox_report() {
   echo ""
   echo "Results: ${PASS} passed, ${FAIL} failed"

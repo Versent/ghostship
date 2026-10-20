@@ -1,0 +1,236 @@
+# ghostship.yaml.example
+#
+# Copy to config/ghostship.yaml and change only the keys you want to override.
+# Every key below is set to its built-in default — an empty ghostship.yaml is
+# equivalent to this file unchanged.
+#
+# Config resolution (deep merge, later layers win at the individual key level):
+#   1. built-in defaults
+#   2. config/ghostship.yaml            ← this file, when present
+#   3. XDG override                     ← ~/Library/Application Support/ghost-academy/ghostship.yaml (macOS)
+#                                          ~/.config/ghost-academy/ghostship.yaml (Linux)
+#
+# Passing --config <path> to install.sh replaces layers 2 + 3 entirely.
+# Lists are replaced in full, not merged. Credentials are never set here —
+# use `ghostship auth login <backend>` instead.
+#
+# Full reference: docs/configuration.md
+
+# ── Network ───────────────────────────────────────────────────────────────────
+
+network:
+  # Address ga-portal (Caddy) publishes on — the only thing this setting
+  # controls. 127.0.0.1 (default) keeps ghostship reachable from this machine
+  # only. Set 0.0.0.0 (all interfaces) or a specific interface address for
+  # remote access; any non-loopback host needs api_key below (or api_key: false).
+  # The transport always listens on 0.0.0.0 inside its own container.
+  host: "127.0.0.1"
+
+  # Host port ga-portal (Caddy) listens on.
+  port: 64057
+
+  # Public base URL baked into presigned evac/supply links.
+  # Leave empty for local installs (defaults to http://localhost:<port>).
+  # Required for remote installs so links are reachable from outside the host.
+  host_url: ""
+
+  # Bearer token required on all MCP requests. Three states:
+  #   "<key>"  — authentication on with this key
+  #   ""       — unset: fine on a loopback host; on any other host the install
+  #              warns and aborts (so does the transport at startup)
+  #   false    — explicit opt-out: no authentication, even on a non-loopback
+  #              host (for deployments behind your own auth layer — Tailscale,
+  #              VPN, reverse proxy). Must be the bare YAML boolean, not "false".
+  # --api-key <key> on the install command line overrides this.
+  # (require_api_key is deprecated: use api_key: false instead of "off".)
+  api_key: ""
+
+  # Direct TLS termination. Both must be set together, pointing at files in
+  # the same directory. Leave empty to use Caddy's built-in TLS (portal section).
+  tls:
+    certfile: ""
+    keyfile: ""
+
+# ── Crew ──────────────────────────────────────────────────────────────────────
+
+crew:
+  # Maximum registered crews (running + stopped). Soft housekeeping limit.
+  max_crews: 20
+
+  # Maximum simultaneously running crew containers.
+  # Set to 0 to disable the limit.
+  max_active: 3
+
+  # Stop idle crew containers after this many seconds to free memory.
+  idle_timeout_secs: 300
+
+  # Wall-clock timeout per subagent task (seconds).
+  subagent_timeout_secs: 3600
+
+  # Maximum tasks accepted in a single batch dispatch.
+  batch_max_tasks: 20
+
+  # Maximum seconds a pickup poll waits before returning.
+  pickup_max_poll_secs: 30
+
+  # Absolute path to a host directory of operator standing-order templates.
+  # When set, merged with the built-in academy/orders/ (operator wins on name
+  # collision). Bind-mounted read-only at /mnt/orders inside the transport.
+  orders_dir: ""
+
+  # Git author identity written into all crew commits.
+  # When empty, the per-persona identity is used instead.
+  git:
+    author:
+      name: ""
+      email: ""
+
+  # Memory gate — controls when crews and new spawns are allowed.
+  memory:
+    # Minimum free host memory (GB) required to launch a new crew. 0 = off.
+    min_free_mem_gb: 2.0
+
+    # Minimum free memory (GB) required to accept a new subagent spawn.
+    spawn_min_memory_gb: 1.5
+
+    # Free memory (GB) below which the host reports "tight" pressure.
+    resource_pressure_gb: 2.0
+
+    # Free memory (GB) below which the host reports "critical" pressure.
+    resource_critical_gb: 1.0
+
+    # Consecutive tight-pressure cycles before the Admiral is mailed.
+    spawn_pressure_escalate_cycles: 3
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+
+model:
+  # Global model fallback — the LOWEST-precedence level in the chain, used only
+  # when no per-agent model and no per-backend model is set. There is no global
+  # `override` key: a single model is not accessible across every backend
+  # (kiro, claude and codex use different model namespaces), so a global lock
+  # would break the moment a crew runs on another backend. Use the per-backend
+  # knobs under backends.<b>.model instead.
+  #
+  # Precedence (highest → lowest):
+  #   dispatch(model=…) > backends.<b>.model.override > per-agent
+  #     > backends.<b>.model.default > model.default > built-in
+  default: ""
+
+# ── Backends ──────────────────────────────────────────────────────────────────
+
+backends:
+  # Which agent backend(s) to build into the crew image and use at runtime.
+  # A YAML list; the first entry is the runtime default. kiro is always
+  # available (appended if omitted). Values: kiro, claude, codex.
+  # Uncomment extra entries to build a multi-toolchain image.
+  default:
+    - kiro
+    # - claude
+    # - codex
+
+  kiro:
+    # Per-backend model control for kiro crews:
+    #   override — forces ALL kiro agents to this model, ignoring per-agent
+    #              config. Use when a backend only supports a specific model set.
+    #   default  — fallback for kiro agents with no per-agent model set
+    #              (more specific than the global model.default).
+    model:
+      override: ""
+      default: ""
+
+    # IAM Identity Center start URL + region. Leave empty for Builder ID /
+    # free tier. (Was backends.kiro.identity_provider / .region before TRN-257.)
+    identity_center:
+      url: ""
+      region: ""
+
+  claude:
+    # Per-backend model control for claude crews (see kiro.model above).
+    model:
+      override: ""
+      default: ""
+
+    # Anthropic-compatible base URL (e.g. a local LiteLLM proxy).
+    # Credentials go via `ghostship auth login claude`, not here.
+    base_url: ""
+
+  codex:
+    # Per-backend model control for codex crews (see kiro.model above).
+    model:
+      override: ""
+      default: ""
+
+    # OpenAI-compatible base URL. Empty = https://api.openai.com/v1.
+    # Credentials go via `ghostship auth login codex`, not here.
+    base_url: ""
+
+# ── Portal (Caddy reverse proxy) ──────────────────────────────────────────────
+
+portal:
+  # TLS mode for the Caddy reverse proxy:
+  #   off        — plain HTTP (default, fine for local and Tailscale installs)
+  #   internal   — Caddy's self-signed internal CA
+  #   tailscale  — Tailscale HTTPS certificates (requires a Tailscale domain)
+  #   acme       — Let's Encrypt (requires a public domain set below)
+  tls_mode: "off"
+
+  # Public domain for ACME (Let's Encrypt). Required when tls_mode: acme.
+  domain: ""
+
+  # Lifetime (seconds) of gs_session cookies issued by /dashboard/login.
+  session_ttl_secs: 86400
+
+  dashboard:
+    # Allocate a dashboard port on every launch() call when true.
+    default: false
+
+    # Host port range for per-crew dashboard allocations.
+    port_range:
+      start: 64058
+      size: 64
+
+  # HTTP rate limiting per endpoint. Format: "requests:window_seconds".
+  # Set enabled: false to disable all rate limiting.
+  rate_limit:
+    enabled: true
+    login_get: "30:60"
+    login_post: "5:300"
+    mcp: "300:60"
+    files: "60:60"
+    crew_api: "120:60"
+    dashboard_auth: "600:60"
+
+# ── Machine (dedicated Podman machine / instance) ─────────────────────────────
+
+machine:
+  # Provision an isolated Podman machine (macOS) or systemd socket instance
+  # (Linux) used exclusively for Ghost Academy. Strongly recommended — it
+  # isolates crew containers from your default Podman runtime.
+  # Set to false to use the default Podman socket instead.
+  dedicated: true
+
+  # Name of the dedicated machine / instance.
+  name: "ghost-academy"
+
+  # Resources allocated to the dedicated VM (macOS only).
+  # These are ceilings, not upfront reservations — idle usage is much lower.
+  resources:
+    cpus: 8
+    memory_mb: 16384
+    disk_gb: 100
+
+  # ── Images (advanced / expert only) ─────────────────────────────────────────
+  # Normal installs never need to touch this section.
+  # (Was a top-level images: section before TRN-257.)
+  images:
+    # Path to the Podman socket inside the dedicated machine. Resolved
+    # automatically by install.sh — only override for non-standard setups.
+    podman_socket: "/run/user/1000/podman/podman.sock"
+
+    # Crew container image. Override to test a custom spec-ops build.
+    kc_image: "localhost/spec-ops:latest"
+
+    # KiroCrew base image. Empty = pinned by install.sh automatically.
+    # Set explicitly only to test a specific KiroCrew version.
+    kc_base_image: ""

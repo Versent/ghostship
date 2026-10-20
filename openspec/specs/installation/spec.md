@@ -51,27 +51,65 @@ The system SHALL accept a `--port` flag controlling the MCP listener port (defau
 - **WHEN** `install.sh` runs without `--public-url`
 - **THEN** `GA_HOST_URL` defaults to `http://localhost:{PORT}`
 
-### Requirement: Identity provider configuration resolution order
-The system SHALL resolve `KIRO_IDENTITY_PROVIDER`/`KIRO_REGION`/`KIRO_LICENSE` in a fixed order: a `--config` file first, then individual CLI flags, then an interactive prompt if still unset and running in a terminal.
+### Requirement: Config file resolution
+The system SHALL resolve configuration by deep-merging three layers in order: built-in
+defaults, then `config/ghostship.yaml` in the ghostship directory (if present), then
+the XDG override file (if present). When `--config <path>` is passed, it replaces
+layers 2 and 3 entirely. The system SHALL resolve `KIRO_IDENTITY_PROVIDER`
+and `KIRO_REGION` from the merged config under `backends.kiro.identity_center.*`
+before falling back to individual CLI flags, then an interactive prompt if still
+unset and running in a terminal.
 
-#### Scenario: Config file sets identity provider, no flags override
-- **WHEN** `install.sh` runs with `--config <path>` and the config file exports `KIRO_IDENTITY_PROVIDER` and no `--identity-provider` flag is passed
-- **THEN** the transport uses the config file value
+#### Scenario: Repo config sets identity provider
+- **WHEN** `config/ghostship.yaml` sets `backends.kiro.identity_provider` and `backends.kiro.region`
+- **AND** no `--identity-provider` flag is passed
+- **THEN** install.sh uses the config values
 
-#### Scenario: CLI flag overrides config file identity provider
-- **WHEN** `install.sh` runs with `--config <path> --identity-provider <url>` and the config file also exports `KIRO_IDENTITY_PROVIDER`
-- **THEN** the CLI flag value wins (flags override config file)
+#### Scenario: XDG override sets identity provider
+- **WHEN** the XDG override file sets `backends.kiro.identity_provider`
+- **AND** `config/ghostship.yaml` does not set it
+- **THEN** install.sh uses the XDG value
 
-#### Scenario: No config and non-interactive
-- **WHEN** `install.sh` runs with none of `--config`, `--identity-provider` set, and stdin is not a terminal
-- **THEN** the script proceeds without prompting, leaving identity provider settings unset (Builder ID fallback)
+#### Scenario: --config flag replaces implicit resolution
+- **WHEN** `--config /path/to/custom.yaml` is passed
+- **THEN** only that file and built-in defaults are used; repo and XDG files are ignored
 
-### Requirement: Config file integration with install flags
-The `--config <path>` flag SHALL source the specified file before processing other flags. All flags in the argument parser (including `--public-url`, `--port`, `--api-key`, etc.) SHALL override values set by the config file.
+### Requirement: Auto-migration from ghostship.conf on install
+When install.sh finds `config/ghostship.conf` with no `config/ghostship.yaml`, it
+SHALL automatically convert the conf to YAML, write `config/ghostship.yaml`, rename
+the old file to `config/ghostship.conf.bak`, and print a clear migration notice
+before proceeding with the install.
 
-#### Scenario: Config file sets public URL, flag overrides
-- **WHEN** `install.sh` runs with `--config ./site.conf --public-url https://override.com` and `site.conf` exports `GA_HOST_URL=https://config.com`
-- **THEN** `GA_HOST_URL` SHALL be `https://override.com` (flag wins)
+#### Scenario: Auto-migration runs on upgrade
+- **WHEN** `config/ghostship.conf` exists and `config/ghostship.yaml` does not
+- **THEN** install.sh prints a migration notice, writes `config/ghostship.yaml`, and renames `config/ghostship.conf` to `config/ghostship.conf.bak`
+
+#### Scenario: Install proceeds after migration
+- **WHEN** auto-migration completes
+- **THEN** install.sh continues with the migrated `config/ghostship.yaml` and completes normally
+
+### Requirement: Wizard generates ghostship.yaml
+The install wizard (run on first install or with `--wizard`) SHALL generate
+`config/ghostship.yaml` with operator-supplied values and inline comments from an
+internal template. It SHALL NOT generate `ghostship.conf`.
+
+After the transport has passed its health check, the wizard SHALL unconditionally run `ghostship setup` to wire skill symlinks and register the MCP server for all detected agent clients. No confirmation prompt is shown for this step — the wizard always wires harnesses on a successful first install.
+
+#### Scenario: Wizard writes YAML config
+- **WHEN** the wizard completes
+- **THEN** `config/ghostship.yaml` exists with the operator's choices and all other keys commented out at their defaults
+
+#### Scenario: Wizard does not overwrite existing config
+- **WHEN** `config/ghostship.yaml` already exists and `--wizard` is passed
+- **THEN** the wizard prompts before overwriting (existing behaviour preserved)
+
+#### Scenario: Wizard runs ghostship setup unconditionally
+- **WHEN** the wizard completes and the transport passes its health check
+- **THEN** `ghostship setup` is invoked automatically with no confirmation prompt, and skill symlinks and MCP registration are applied for all detected agent clients
+
+#### Scenario: Wizard setup fails gracefully
+- **WHEN** `ghostship setup` invoked by the wizard exits non-zero (e.g. no supported agent client detected)
+- **THEN** a warning is printed but the overall install exits 0; `ghostship setup` can be re-run manually
 
 ### Requirement: Idempotent, repeatable install
 The system SHALL be safe to re-run: existing images are rebuilt, the existing `ga-transport` container is replaced, and an already-existing `ga-net` network is left untouched rather than erroring. Crew workspace/home volumes are out of scope for `install.sh` — they are created per-crew by `launch`, not by installation.
@@ -81,27 +119,31 @@ The system SHALL be safe to re-run: existing images are rebuilt, the existing `g
 - **THEN** the script removes and recreates only the `ga-transport` container with freshly built images, without erroring on the already-existing network
 
 ### Requirement: File-based transport auth persistence
-The installation SHALL persist reusable kiro-cli auth as a single plain file, `DATA_DIR/ga-kiro-auth`, mode `0600` — not a Podman secret. No dedicated bind mount, migration step, or file-driver access is needed: `DATA_DIR` is already bind-mounted read/write into the transport container as `/data`, so transport reads and writes the file directly.
+The installation SHALL persist backend credentials only as plain files under `DATA_DIR`, mode `0600`, written by the transport's credential store. They SHALL NOT be stored as Podman secrets. No dedicated bind mount, migration step, or file-driver access is needed: `DATA_DIR` is already bind-mounted read/write into the transport container as `/data`, so the transport reads and writes the files directly.
 
 #### Scenario: Install with no existing auth file
-- **WHEN** installation runs before `ga-kiro-auth` exists
-- **THEN** the transport starts with no auth file present, and the existing first-time device-auth flow remains available to create it
+- **WHEN** installation runs before any backend credential exists
+- **THEN** the transport starts with an empty credential store, and `ghostship auth login <backend>` remains available to populate it
 
 #### Scenario: Install with an existing auth file
-- **WHEN** installation runs and `DATA_DIR/ga-kiro-auth` already has content from a previous install
-- **THEN** the transport reads it directly via the existing `/data` mount, with no separate migration or projection step required
+- **WHEN** installation runs and `DATA_DIR` already holds backend credentials from a previous install
+- **THEN** the transport reads them directly via the existing `/data` mount, and the installer neither reads nor modifies them
 
 #### Scenario: Ordinary uninstall preserves reusable auth
 - **WHEN** uninstall runs without `--purge-auth`
-- **THEN** transport state other than `ga-kiro-auth` is removed while that file is retained
+- **THEN** transport state other than the backend credential files (kiro, claude and codex) is removed while those files are retained
 
 #### Scenario: Ordinary uninstall on Linux preserves reusable auth even without --keep-machine
 - **WHEN** `uninstall.sh` runs on Linux without `--purge-auth` and without `--keep-machine`
-- **THEN** `ga-kiro-auth` is retained; only the dedicated instance's `containers/` storage root is removed during machine teardown, not the entire `~/.local/share/${GA_MACHINE_NAME}` tree
+- **THEN** the backend credential files are retained; only the dedicated instance's `containers/` storage root is removed during machine teardown, not the entire `~/.local/share/${GA_MACHINE_NAME}` tree
 
 #### Scenario: Purge uninstall removes reusable auth
 - **WHEN** uninstall runs with `--purge-auth`
-- **THEN** `ga-kiro-auth` is also removed
+- **THEN** every backend credential file is also removed
+
+#### Scenario: Uninstall removes obsolete credential secrets
+- **WHEN** uninstall runs and obsolete backend credential Podman secrets (`ga-crew-anthropic-api-key`, `ga-claude-code-oauth-token`, `ga-crew-openai-api-key`, `ga-kiro-api-key`) exist
+- **THEN** those secrets are removed
 
 ### Requirement: Container base images use deterministic references
 
@@ -329,30 +371,48 @@ The seven volume entries in the generated `compose.yml` SHALL include `${DATA_DI
 - **THEN** `podman compose down` stops and removes the container cleanly
 
 ### Requirement: Shell scripts reorganised under scripts/
-`start.sh` and `uninstall.sh` SHALL be located at `scripts/start.sh` and `scripts/uninstall.sh` respectively. `install.sh` at the repo root SHALL remain as a shim that delegates to `scripts/install.sh` with all arguments forwarded, preserving backward compatibility for existing workflows. The shim SHALL forward `--client-only` and all other flags unchanged.
+`start.sh` and `uninstall.sh` SHALL be located at `bin/start.sh` and `bin/uninstall.sh` respectively. `install.sh` at the repo root SHALL remain as a shim that delegates to `bin/install.sh` with all arguments forwarded, preserving backward compatibility for existing workflows. The shim SHALL forward `--client-only` and all other flags unchanged.
 
 #### Scenario: start.sh and uninstall.sh in scripts/
 - **WHEN** a user clones the repository
-- **THEN** `scripts/start.sh` and `scripts/uninstall.sh` exist and are executable, and no `start.sh` or `uninstall.sh` exist at the repo root
+- **THEN** `bin/start.sh` and `bin/uninstall.sh` exist and are executable, and no `start.sh` or `uninstall.sh` exist at the repo root
 
 #### Scenario: install.sh shim at root
 - **WHEN** `./install.sh [flags]` is invoked
-- **THEN** `scripts/install.sh [flags]` runs with all arguments forwarded and the exit code is preserved
+- **THEN** `bin/install.sh [flags]` runs with all arguments forwarded and the exit code is preserved
 
 #### Scenario: install.sh shim forwards --client-only
 - **WHEN** `./install.sh --client-only [flags]` is invoked
-- **THEN** `scripts/install.sh --client-only [flags]` runs with all arguments forwarded and the exit code is preserved
+- **THEN** `bin/install.sh --client-only [flags]` runs with all arguments forwarded and the exit code is preserved
+
+### Requirement: PyYAML vendored — python3 is the only YAML config prerequisite
+
+The ghostship repository SHALL include a vendored copy of the PyYAML pure-Python
+package at `bin/lib/vendor/yaml/`. `bin/install.sh`, `bin/start.sh`, and
+`bin/uninstall.sh` SHALL invoke `yaml_config.py` with
+`PYTHONPATH="${GHOSTSHIP_DIR}/bin/lib/vendor" python3` so that `import yaml`
+always resolves to the vendored copy without requiring PyYAML to be installed
+on the system Python, and without creating a virtual environment. The only
+prerequisite for YAML config parsing SHALL be a working `python3` binary.
+
+#### Scenario: Install succeeds with only python3 — no PyYAML installed
+- **WHEN** `bin/install.sh --client-only` is invoked on a host where PyYAML is not installed in the system Python
+- **THEN** the install completes successfully, no venv is created, and no pip or uv commands are executed
+
+#### Scenario: Vendored yaml takes precedence over any system installation
+- **WHEN** `bin/install.sh` invokes `yaml_config.py`
+- **THEN** the `yaml` module resolves from `bin/lib/vendor/` via `PYTHONPATH`, regardless of whether a different version is installed system-wide
 
 ### Requirement: ghostship CLI available on PATH after install
-`scripts/install.sh` SHALL make the `ghostship` CLI script available on `PATH` after a successful run.
+`bin/install.sh` SHALL make the `ghostship` CLI script available on `PATH` after a successful run.
 
 #### Scenario: ~/.local/bin present and on PATH
-- **WHEN** `scripts/install.sh` completes successfully and `~/.local/bin` exists and is on `PATH`
+- **WHEN** `bin/install.sh` completes successfully and `~/.local/bin` exists and is on `PATH`
 - **THEN** `~/.local/bin/ghostship` is a symlink pointing to the `ghostship` script in the repo
 
 #### Scenario: ~/.local/bin not on PATH
-- **WHEN** `scripts/install.sh` completes and `~/.local/bin` is not on `PATH`
-- **THEN** `scripts/install.sh` prints a clear one-line message instructing the user to add `~/.local/bin` to their `PATH`
+- **WHEN** `bin/install.sh` completes and `~/.local/bin` is not on `PATH`
+- **THEN** `bin/install.sh` prints a clear one-line message instructing the user to add `~/.local/bin` to their `PATH`
 
 ### Requirement: podman-compose required as a prerequisite
 The system SHALL require `podman-compose` to be installed before `install.sh` runs. `install.sh` SHALL check for `podman-compose` specifically and exit with a clear error and install instructions if it is not found. `docker-compose` and `docker compose` are NOT acceptable alternatives because Ghostship's generated `compose.yml` uses external Podman secrets that Docker Compose does not support.
@@ -556,113 +616,6 @@ The spec-ops image SHALL record its toolchain list in the `org.ghostship.toolcha
 - **WHEN** the existing image's label equals the new `AGENT_TOOLCHAINS` value and the version is unchanged
 - **THEN** `install.sh` does not force a cache-less spec-ops build on account of the toolchains
 
-### Requirement: GA_REQUIRE_API_KEY defaults to error on non-loopback installs
-The `GA_REQUIRE_API_KEY` setting SHALL default to `error` (changed from `warn`). When `HOST` is unset or `127.0.0.1`, the check SHALL be skipped entirely — no API key is required for loopback installs. When `HOST` is any non-loopback value and `GA_API_KEY` is not set, the install SHALL abort with an error message directing the operator to set `GA_API_KEY` or use `GA_REQUIRE_API_KEY=off`. Setting `GA_REQUIRE_API_KEY=off` SHALL allow unauthenticated remote access (for deployments that place their own auth layer in front). The `warn` mode MAY be removed in a future release.
-
-`install.sh` SHALL emit a prominent `WARNING` to stderr when `GA_API_KEY` is not
-set (or empty) **and** the published host port maps to a non-loopback address
-(i.e. anything other than `127.0.0.1` or `::1`). The default published address
-is `0.0.0.0`, which triggers the check. The warning SHALL name the port, state
-that MCP endpoints are accessible to any host that can reach the machine, and
-direct the operator to pass `--api-key` or set `GA_REQUIRE_API_KEY=off` to
-silence it.
-
-`GA_REQUIRE_API_KEY` controls the severity of the check:
-- `error` (default) — print warning and exit non-zero.
-- `warn` — print warning and continue (deprecated; may be removed in a future release).
-- `off` — skip the check entirely.
-
-The transport process SHALL also log a `WARNING`-level message at startup when
-`GA_API_KEY` is absent and the `HOST` environment variable is not a loopback
-address (`127.0.0.1` or `::1`).
-
-#### Scenario: Remote install without API key aborts
-- **WHEN** `install.sh` is run with `HOST=0.0.0.0` and `GA_API_KEY` is not set and `GA_REQUIRE_API_KEY` is not `off`
-- **THEN** the install aborts with a non-zero exit code before starting any containers, and the error message names `GA_API_KEY` and `GA_REQUIRE_API_KEY=off` as the resolution paths
-
-#### Scenario: Local install without API key succeeds
-- **WHEN** `install.sh` is run with `HOST=127.0.0.1` (or `HOST` unset) and `GA_API_KEY` is not set
-- **THEN** the install completes normally and the transport starts without authentication
-
-#### Scenario: Remote install with GA_REQUIRE_API_KEY=off succeeds
-- **WHEN** `install.sh` is run with `HOST=0.0.0.0`, `GA_API_KEY` not set, and `GA_REQUIRE_API_KEY=off`
-- **THEN** the install completes normally with a warning logged that the transport is unauthenticated
-
-#### Scenario: GA_REQUIRE_API_KEY=warn without API key on non-loopback address emits warning and continues
-- **WHEN** `install.sh` runs without `--api-key`, `GA_REQUIRE_API_KEY=warn`,
-  and the published port maps to `0.0.0.0`
-- **THEN** `install.sh` prints a WARNING to stderr naming the port and stating
-  that unauthenticated access is enabled, and installation continues
-
-#### Scenario: GA_REQUIRE_API_KEY=off suppresses the check
-- **WHEN** `install.sh` runs without `--api-key` and `GA_REQUIRE_API_KEY=off`
-- **THEN** no warning is printed, installation continues normally
-
-#### Scenario: API key set on non-loopback address does not warn
-- **WHEN** `install.sh` runs with `--api-key <value>` and the published port
-  maps to `0.0.0.0`
-- **THEN** no unauthenticated-access warning is printed
-
-#### Scenario: Transport logs startup warning when unauthenticated on non-loopback
-- **WHEN** the transport process starts with `GA_API_KEY` absent and `HOST` set
-  to a non-loopback address
-- **THEN** the transport logs a `WARNING`-level message stating that no API key
-  is configured and MCP endpoints are accessible without authentication
-
-### Requirement: Transport startup enforces GA_REQUIRE_API_KEY=error
-The transport SHALL re-check the `GA_REQUIRE_API_KEY` constraint at startup. If `GA_REQUIRE_API_KEY` is `error` (or unset, i.e. default) and the bind address is non-loopback and no API key secret is present, the transport SHALL refuse to start and exit with a non-zero code.
-
-#### Scenario: Transport refuses to start unauthenticated on non-loopback
-- **WHEN** the transport starts with a non-loopback bind address and no `ga-api-key` secret and `GA_REQUIRE_API_KEY` is not `off`
-- **THEN** the transport exits immediately with a logged error naming the missing API key
-
-### Requirement: GA_REQUIRE_API_KEY and GA_TRUSTED_PROXY documented in configuration docs
-`docs/configuration.md` SHALL include entries for `GA_REQUIRE_API_KEY` (its three
-values, the default, and when to use `error` or `off`) and `GA_TRUSTED_PROXY`
-(what it does, the default, and how to set it for Caddy-fronted installs).
-
-`config/ghostship.conf.example` SHALL include commented-out entries for both
-variables.
-
-#### Scenario: Operator reads docs to understand authentication posture options
-- **WHEN** an operator reads `docs/configuration.md`
-- **THEN** they find `GA_REQUIRE_API_KEY` documented with its three values and
-  the warning behaviour, and `GA_TRUSTED_PROXY` documented with its effect on
-  rate-limit source-IP extraction
-
-#### Scenario: Example config includes both variables
-- **WHEN** an operator opens `config/ghostship.conf.example`
-- **THEN** `GA_REQUIRE_API_KEY` and `GA_TRUSTED_PROXY` are present as commented-out
-  entries with their defaults
-
-### Requirement: install.sh creates Podman secrets for crew API keys
-When `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `KIRO_API_KEY` are set, `install.sh` SHALL create corresponding Podman secrets (`ga-crew-anthropic-api-key`, `ga-crew-openai-api-key`, `ga-kiro-api-key`). Creation SHALL be idempotent: an existing secret with the same name SHALL be removed before recreation.
-
-#### Scenario: Secret created when key is set
-- **GIVEN** `ANTHROPIC_API_KEY=sk-ant-...` is set in the config
-- **WHEN** `install.sh` runs
-- **THEN** `podman secret ls` shows `ga-crew-anthropic-api-key` and the install reports "✓ Podman secret 'ga-crew-anthropic-api-key' created"
-
-#### Scenario: Secret not created when key is absent
-- **GIVEN** `ANTHROPIC_API_KEY` is empty or unset
-- **WHEN** `install.sh` runs
-- **THEN** `podman secret ls` does not show `ga-crew-anthropic-api-key`
-
-#### Scenario: Re-run is idempotent
-- **GIVEN** `ga-crew-anthropic-api-key` already exists from a prior run
-- **WHEN** `install.sh` runs again with the same or a new key value
-- **THEN** the install completes without error and the secret holds the current key value
-
-#### Scenario: Generated compose.yml references new secrets
-- **GIVEN** `ANTHROPIC_API_KEY` and `KIRO_API_KEY` are set
-- **WHEN** `install.sh` generates `compose.yml`
-- **THEN** `compose.yml` lists `ga-crew-anthropic-api-key` and `ga-kiro-api-key` under `ga-transport`'s `secrets:` and under the top-level `secrets:` block as `external: true`
-
-#### Scenario: Generated compose.yml omits absent-key secrets
-- **GIVEN** only `ANTHROPIC_API_KEY` is set; `OPENAI_API_KEY` and `KIRO_API_KEY` are unset
-- **WHEN** `install.sh` generates `compose.yml`
-- **THEN** `compose.yml` references `ga-crew-anthropic-api-key` but does not reference `ga-crew-openai-api-key` or `ga-kiro-api-key`
-
 ### Requirement: install.sh retries compose up on transient port conflict
 `install.sh` SHALL retry the `podman compose up` invocation up to `GA_COMPOSE_RETRY_ATTEMPTS` times (default 3, minimum 1) with a `GA_COMPOSE_RETRY_DELAY_SECS`-second sleep (default 2) between attempts before giving up. On final failure, `install.sh` SHALL print the compose error output and exit non-zero.
 
@@ -809,27 +762,27 @@ unconditionally.
 
 ### Requirement: Model backend settings use their standard names
 
-`install.sh` SHALL read the model backend settings under the names the Claude and Codex CLIs use: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_BASE_URL`. Each SHALL be reset to empty before `ghostship.conf` is sourced, so a value exported in the invoking shell is never used.
+`install.sh` SHALL read the non-secret model backend settings under the names the Claude and Codex CLIs use: `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`. Each SHALL be reset to empty before `ghostship.conf` is sourced, so a value exported in the invoking shell is never used.
 
 #### Scenario: Standard names configure the backends
-- **WHEN** `ghostship.conf` sets `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`
-- **THEN** `install.sh` delivers them as the `ga-crew-anthropic-api-key` and `ga-crew-openai-api-key` Podman secrets and prints no deprecation warning
+- **WHEN** `ghostship.conf` sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`
+- **THEN** `install.sh` passes them to the transport and prints no deprecation warning
 
 #### Scenario: Shell values ignored
-- **WHEN** `ANTHROPIC_API_KEY` or `GA_CREW_ANTHROPIC_API_KEY` is exported in the shell running `install.sh` and neither is set in `ghostship.conf`
-- **THEN** no `ga-crew-anthropic-api-key` secret is created
+- **WHEN** `OPENAI_BASE_URL` is exported in the shell running `install.sh` and not set in `ghostship.conf`
+- **THEN** the transport receives no `OPENAI_BASE_URL`
 
 ### Requirement: Pre-TRN-226 model backend names accepted as deprecated aliases
 
-`install.sh` SHALL accept `GA_CREW_ANTHROPIC_API_KEY`, `GA_CREW_ANTHROPIC_BASE_URL`, `GA_CREW_OPENAI_API_KEY` and `GA_CREW_OPENAI_BASE_URL` from `ghostship.conf` as aliases for the standard names. Each alias in use SHALL print a warning naming the old and new setting, never the value. When both names are set, the standard name SHALL win.
+`install.sh` SHALL accept `GA_CREW_ANTHROPIC_BASE_URL` and `GA_CREW_OPENAI_BASE_URL` from `ghostship.conf` as aliases for the standard names. Each alias in use SHALL print a warning naming the old and new setting, never the value. When both names are set, the standard name SHALL win.
 
 #### Scenario: Old name mapped with a warning
-- **WHEN** `ghostship.conf` sets only `GA_CREW_ANTHROPIC_API_KEY`
-- **THEN** `install.sh` uses its value as `ANTHROPIC_API_KEY` and warns that `GA_CREW_ANTHROPIC_API_KEY` is deprecated, without printing the value
+- **WHEN** `ghostship.conf` sets only `GA_CREW_OPENAI_BASE_URL`
+- **THEN** `install.sh` uses its value as `OPENAI_BASE_URL` and warns that `GA_CREW_OPENAI_BASE_URL` is deprecated
 
 #### Scenario: Standard name wins
-- **WHEN** `ghostship.conf` sets both `ANTHROPIC_API_KEY` and `GA_CREW_ANTHROPIC_API_KEY`
-- **THEN** `install.sh` uses `ANTHROPIC_API_KEY` and warns that the old name is ignored
+- **WHEN** `ghostship.conf` sets both `OPENAI_BASE_URL` and `GA_CREW_OPENAI_BASE_URL`
+- **THEN** `install.sh` uses `OPENAI_BASE_URL` and warns that the old name is ignored
 
 ### Requirement: Interactive guided setup when no ghostship.conf exists
 When `install.sh` is run and no `ghostship.conf` exists in the current directory (or `--setup` flag is passed), the installer SHALL enter an interactive guided setup mode. The existing non-interactive path SHALL be unchanged when a `ghostship.conf` is present.
@@ -843,7 +796,7 @@ When `install.sh` is run and no `ghostship.conf` exists in the current directory
 - **THEN** the installer proceeds non-interactively as before, without any prompts
 
 ### Requirement: Interactive setup collects backend and non-secret config
-The interactive setup SHALL prompt the operator to choose a default agent backend (`kiro` default, `claude`, `codex`) and optional additional backends, then collect only the non-secret config for the selected backends (`KIRO_IDENTITY_PROVIDER`/`KIRO_REGION` for kiro; nothing for claude; `OPENAI_BASE_URL` for codex). Collected values SHALL be written to a new `ghostship.conf` (mode `600`, non-empty vars only, no secrets) before the build proceeds. Secret injection (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`) SHALL be deferred to `ghostship auth login <backend>`.
+The interactive setup SHALL prompt the operator to choose a default agent backend (`kiro` default, `claude`, `codex`) and optional additional backends, then collect only the non-secret config for the selected backends (`KIRO_IDENTITY_PROVIDER`/`KIRO_REGION` for kiro; nothing for claude; `OPENAI_BASE_URL` for codex). Collected values SHALL be written to a new `ghostship.conf` (mode `600`, non-empty vars only, no secrets) before the build proceeds. All credentials SHALL be left to `ghostship auth login <backend>`.
 
 #### Scenario: Selecting kiro backend prompts for identity provider
 - **WHEN** the operator selects `kiro` as the backend
@@ -851,18 +804,26 @@ The interactive setup SHALL prompt the operator to choose a default agent backen
 
 #### Scenario: Selecting claude backend collects no secret config
 - **WHEN** the operator selects `claude` as a backend
-- **THEN** the installer collects no config and instructs the operator to run `ghostship auth login anthropic` after install
+- **THEN** the installer collects no config and does not print a `ghostship auth login anthropic` hint (the post-start login offer covers it)
 
 #### Scenario: Multiple backends enabled simultaneously
 - **WHEN** the operator selects `kiro` as default and adds `claude,codex`
 - **THEN** `GA_CREW_AGENT=kiro,claude,codex` is written to `ghostship.conf` with `kiro` as the runtime default
 
 ### Requirement: Interactive setup runs login flow after transport starts
-After the transport is started successfully, the interactive setup SHALL automatically trigger the login flow for the selected backend and display the login URL or device code to the operator. The installer SHALL wait for login completion before exiting, so the operator finishes the install already authenticated.
+After the transport starts successfully, the interactive setup SHALL offer, for each enabled backend with no stored credential, to run `ghostship auth login <backend>`. Accepting SHALL run that command in the foreground against the just-installed transport (including its port and bearer key). Declining SHALL print the command to run later. The install SHALL succeed either way.
 
 #### Scenario: Login flow triggered automatically after install
-- **WHEN** interactive setup completes the build and starts the transport
-- **THEN** the appropriate login flow is started automatically and the operator is shown the login URL or device code without a separate manual step
+- **WHEN** interactive setup starts the transport with `GA_CREW_AGENT=kiro,claude` and neither backend holds a credential
+- **THEN** the operator is offered `ghostship auth login kiro` and then `ghostship auth login claude`
+
+#### Scenario: Login on a keyed install
+- **WHEN** the transport was installed with a bearer key and the operator accepts the login offer
+- **THEN** the login request carries that key and succeeds
+
+#### Scenario: Backend already authenticated
+- **WHEN** a backend already holds a stored credential
+- **THEN** no login is offered for it
 
 ### Requirement: Interactive setup offers harness registration
 After login completes, the interactive setup SHALL offer to run `ghostship setup` to register the MCP server with detected harnesses (kiro-cli, Claude Code, opencode). The operator can accept or skip.
@@ -870,6 +831,155 @@ After login completes, the interactive setup SHALL offer to run `ghostship setup
 #### Scenario: Harness registration is optional
 - **WHEN** the operator declines harness registration during interactive setup
 - **THEN** the install completes normally without running `ghostship setup`
+
+### Requirement: Installer never handles backend credentials
+`install.sh` SHALL NOT read, create, remove or mount any backend credential: no `ga-crew-anthropic-api-key`, `ga-claude-code-oauth-token`, `ga-crew-openai-api-key` or `ga-kiro-api-key` secret operations, and no such secrets in the generated `compose.yml`. Re-running install, with or without `--wizard`, SHALL leave stored credentials unchanged.
+
+#### Scenario: Re-install keeps credentials
+- **WHEN** claude holds a stored setup-token and `install.sh --wizard` is run
+- **THEN** claude's stored credential is unchanged after install
+
+#### Scenario: Compose has no credential secrets
+- **WHEN** `install.sh` generates `compose.yml`
+- **THEN** it references none of the backend credential secrets
+
+### Requirement: Credential settings in ghostship.conf are ignored with a warning
+When `ghostship.conf` sets `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `KIRO_API_KEY`, `GA_CREW_ANTHROPIC_API_KEY` or `GA_CREW_OPENAI_API_KEY`, `install.sh` SHALL warn naming the setting and the `ghostship auth login <backend>` command that replaces it, never the value, and SHALL otherwise ignore it.
+
+#### Scenario: Leftover token in conf
+- **WHEN** `ghostship.conf` sets `CLAUDE_CODE_OAUTH_TOKEN`
+- **THEN** install warns that it is ignored and to use `ghostship auth login claude`, and creates no secret
+
+### Requirement: HOST controls only the Caddy host bind address
+
+`HOST` (`network.host`) SHALL set only the host address `ga-portal` publishes on, for both `PORT` and the dashboard port range. It SHALL default to `127.0.0.1`. The transport container SHALL always listen on `0.0.0.0` internally, whatever `HOST` is, and Caddy's upstream dial strings SHALL remain `ga-transport:64057`. `docs/configuration.md` SHALL describe this split in the `HOST` entry.
+
+#### Scenario: Default install is reachable only from the local machine
+- **WHEN** `install.sh` regenerates `compose.yml` with `HOST` unset
+- **THEN** `ga-portal` publishes `PORT` and the dashboard port range on `127.0.0.1` only
+- **AND** the transport container listens on `0.0.0.0` inside its container
+
+#### Scenario: Loopback HOST still reaches the transport through the portal
+- **WHEN** `HOST=127.0.0.1` and a client on the host requests `http://localhost:{PORT}/mcp`
+- **THEN** Caddy proxies the request to `ga-transport:64057` and the transport answers it, with no `502` from a refused upstream connection
+
+#### Scenario: Custom HOST changes only the portal bind
+- **WHEN** `HOST=192.168.1.10` is set and `install.sh` regenerates `compose.yml`
+- **THEN** `ga-portal` publishes `PORT` and the dashboard port range on `192.168.1.10`
+- **AND** the transport container's listen address remains `0.0.0.0`
+- **AND** Caddy's upstream dial string remains `ga-transport:64057`
+
+#### Scenario: Wildcard HOST exposes the portal on all interfaces
+- **WHEN** `HOST=0.0.0.0` is set and `install.sh` regenerates `compose.yml`
+- **THEN** `ga-portal` publishes `PORT` and the dashboard port range on all host interfaces
+
+### Requirement: Install readiness is verified through the portal
+
+`install.sh` and `ghostship start` SHALL report the transport ready only when a `/health` request sent to the address and `PORT` that `ga-portal` publishes on succeeds, and is proxied through to the transport. A transport that answers only inside its own container SHALL NOT count as ready. Wildcard `HOST` values SHALL be probed via `127.0.0.1`.
+
+#### Scenario: Unreachable transport behind the portal fails readiness
+- **WHEN** the transport is running but `ga-portal` cannot reach it, so `/health` through the portal returns `502`
+- **THEN** `install.sh` does not report the transport ready and exits non-zero once the readiness timeout expires, naming the portal-to-transport path
+
+#### Scenario: Specific HOST is probed at that address
+- **WHEN** `HOST=192.168.1.10`
+- **THEN** the readiness probe targets `http://192.168.1.10:{PORT}/health`
+
+### Requirement: API key resolution order
+
+`install.sh` SHALL resolve the endpoint API key from, in order of precedence: the `--api-key` flag, then `network.api_key` in the resolved YAML config, then the key persisted in `DATA_DIR` by a previous `--api-key`. A key or opt-out set in the YAML config SHALL NOT be overridden by a previously persisted key.
+
+#### Scenario: YAML key wins over a stale persisted key
+- **WHEN** `DATA_DIR/ga-api-key` holds `old-key`, `network.api_key` is `new-key`, and `install.sh` runs without `--api-key`
+- **THEN** the transport is configured with `new-key`
+
+#### Scenario: YAML opt-out wins over a persisted key
+- **WHEN** `DATA_DIR/ga-api-key` holds a key, `network.api_key` is `false`, and `install.sh` runs without `--api-key`
+- **THEN** API-key authentication is disabled
+
+#### Scenario: Flag wins over YAML
+- **WHEN** `network.api_key` is `yaml-key` and `install.sh` runs with `--api-key flag-key`
+- **THEN** the transport is configured with `flag-key`
+
+#### Scenario: Empty flag clears the persisted key and falls through to YAML
+- **WHEN** `DATA_DIR` holds a persisted key, `network.api_key` is `yaml-key`, and `install.sh` runs with `--api-key ""`
+- **THEN** the persisted key is deleted and the transport is configured with `yaml-key`
+
+#### Scenario: Persisted key used when nothing else is set
+- **WHEN** `DATA_DIR/ga-api-key` holds `old-key`, `network.api_key` is unset, and `install.sh` runs without `--api-key`
+- **THEN** the transport is configured with `old-key`
+
+### Requirement: Non-loopback installs require an API key or an explicit opt-out
+The check SHALL evaluate the address `ga-portal` publishes on (`HOST`), never the transport's in-container listen address. A loopback `HOST` (unset, `127.0.0.0/8`, `::1`, `localhost`) needs no key. Any other `HOST` (`0.0.0.0`, `::`, or a specific address) SHALL need a non-empty key or the explicit opt-out `network.api_key: false`. If the key is unset, the install SHALL abort before starting any containers.
+
+#### Scenario: Remote install without API key aborts
+- **WHEN** `install.sh` is run with `HOST=0.0.0.0` and the API key is unset
+- **THEN** `install.sh` aborts with a non-zero exit code before starting any containers
+
+#### Scenario: Specific non-loopback address without API key aborts
+- **WHEN** `install.sh` is run with `HOST=192.168.1.10` and the API key is unset
+- **THEN** the install aborts with a non-zero exit code before starting any containers
+
+#### Scenario: Local install without API key succeeds
+- **WHEN** `install.sh` is run with `HOST=127.0.0.1` (or `HOST` unset) and the API key is unset
+- **THEN** the install completes normally with no API-key warning, the portal is published on loopback only, and the transport starts without authentication
+
+#### Scenario: Remote install with explicit opt-out succeeds
+- **WHEN** `install.sh` is run with `HOST=0.0.0.0` and `network.api_key: false`
+- **THEN** the install completes and the transport starts without authentication
+
+#### Scenario: API key set on non-loopback address succeeds
+- **WHEN** `install.sh` runs with `--api-key <value>` and `HOST=0.0.0.0`
+- **THEN** the install completes with authentication enabled and no unauthenticated-access warning is printed
+
+### Requirement: Unauthenticated non-loopback exposure is warned about
+When an install aborts for an unset key, `install.sh` SHALL print a `WARNING` naming the published address and port, stating MCP endpoints would be reachable by any host that can reach it, and listing the fixes: set an API key, set `HOST=127.0.0.1`, or set `network.api_key: false`. With the opt-out on a non-loopback `HOST`, `install.sh` and the transport at startup SHALL each emit a `WARNING` that the endpoint is unauthenticated.
+
+#### Scenario: Abort message lists the resolution paths
+- **WHEN** `install.sh` aborts because `HOST=0.0.0.0` and the API key is unset
+- **THEN** the WARNING names the address and port, and lists setting an API key, `HOST=127.0.0.1`, and `network.api_key: false`
+
+#### Scenario: Opt-out install warns
+- **WHEN** `install.sh` is run with `HOST=0.0.0.0` and `network.api_key: false`
+- **THEN** `install.sh` prints a WARNING that the endpoint is unauthenticated by explicit choice
+
+#### Scenario: Transport logs startup warning when unauthenticated on non-loopback
+- **WHEN** the transport process starts with no API key, the explicit opt-out set, and a non-loopback portal address
+- **THEN** the transport logs a `WARNING`-level message stating that no API key
+  is configured and MCP endpoints are accessible without authentication
+
+### Requirement: Transport startup enforces the API-key requirement
+The transport SHALL re-check the API-key requirement at startup against the portal's published address, not its own in-container listen address. If the portal's published address is non-loopback, no API key secret is present, and the explicit opt-out is not set, the transport SHALL refuse to start and exit with a non-zero code.
+
+#### Scenario: Transport refuses to start unauthenticated on non-loopback
+- **WHEN** the transport starts with a non-loopback portal address, no `ga-api-key` secret, and no explicit opt-out
+- **THEN** the transport exits immediately with a logged error naming the missing API key
+
+#### Scenario: Fixed wildcard listen address does not trip the check
+- **WHEN** the transport starts listening on `0.0.0.0` in its container, the portal's published address is `127.0.0.1`, and no API key is present
+- **THEN** the transport starts normally without the API-key error
+
+### Requirement: API-key opt-out and GA_TRUSTED_PROXY documented in configuration docs
+`docs/configuration.md` SHALL document `network.api_key` (string to enable,
+unset to require one on non-loopback installs, `false` to opt out explicitly)
+and the deprecation of `network.require_api_key`/`GA_REQUIRE_API_KEY`, together
+with `GA_TRUSTED_PROXY` (what it does, the default, and how to set it for
+Caddy-fronted installs).
+
+`config/ghostship.yaml.example` SHALL show `network.api_key` with a comment
+describing all three states, and SHALL NOT include `network.require_api_key`.
+
+#### Scenario: Operator reads docs to understand authentication posture options
+- **WHEN** an operator reads `docs/configuration.md`
+- **THEN** they find `network.api_key` documented with its three states and
+  the abort behaviour, a deprecation note for `network.require_api_key`, and
+  `GA_TRUSTED_PROXY` documented with its effect on rate-limit source-IP
+  extraction
+
+#### Scenario: Example config shows the opt-out
+- **WHEN** an operator opens `config/ghostship.yaml.example`
+- **THEN** `network.api_key` is present with a comment explaining string, unset,
+  and `false`, and `network.require_api_key` is absent
 
 ## Interactive Setup Mode
 

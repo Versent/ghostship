@@ -205,6 +205,41 @@ class _EnsureRunningBase(unittest.TestCase):
             p.stop()
 
 
+# ── TestRestartKeepsBackend (TRN-259) ─────────────────────────────────────────
+
+class TestRestartKeepsBackend(_EnsureRunningBase):
+    """Restarts re-patch the crew config from the recorded acp_backend, not the
+    transport default."""
+
+    def _patched_backend(self):
+        _args, kwargs = self.life._patch_crew_config.call_args
+        return kwargs["backend"]
+
+    def test_ensure_running_kiro_crew_under_claude_default(self):
+        self.crews[CREW_ID]["acp_backend"] = "kiro"
+        with patch.object(self.life, "GA_CREW_ACP_BACKEND", "claude"):
+            self.launcher.ensure_running(dict(self.crews[CREW_ID]), CREW_ID)
+        self.assertEqual(self._patched_backend(), "kiro")
+
+    def test_ensure_running_claude_crew_under_kiro_default(self):
+        self.crews[CREW_ID]["acp_backend"] = "claude"
+        with patch.object(self.life, "GA_CREW_ACP_BACKEND", "kiro"):
+            self.launcher.ensure_running(dict(self.crews[CREW_ID]), CREW_ID)
+        self.assertEqual(self._patched_backend(), "claude")
+
+    def test_ensure_running_missing_backend_is_kiro(self):
+        self.crews[CREW_ID].pop("acp_backend", None)
+        with patch.object(self.life, "GA_CREW_ACP_BACKEND", "claude"):
+            self.launcher.ensure_running(dict(self.crews[CREW_ID]), CREW_ID)
+        self.assertEqual(self._patched_backend(), "kiro")
+
+    def test_reconcile_restart_cycle_uses_recorded_backend(self):
+        self.crews[CREW_ID]["acp_backend"] = "kiro"
+        with patch.object(self.life, "GA_CREW_ACP_BACKEND", "claude"):
+            self.launcher._run_restart_cycle(dict(self.crews[CREW_ID]), CREW_ID)
+        self.assertEqual(self._patched_backend(), "kiro")
+
+
 # ── TestEnsureRunning ─────────────────────────────────────────────────────────
 
 class TestEnsureRunning(_EnsureRunningBase):
@@ -297,6 +332,7 @@ class TestEnsureRunningConcurrency(_EnsureRunningBase):
         # container_start twice — initial start + post-config-repatch restart —
         # so counting container_start calls would not isolate the leader).
         self.assertEqual(self.life._patch_crew_config.call_count, 1)
+        self.assertIn("backend", self.life._patch_crew_config.call_args.kwargs)
         self.assertEqual(len(results), 2)
         # Both callers returned a crew dict (neither the nuked sentinel). The
         # authoritative status lives in the registry — the leader's returned
@@ -560,5 +596,240 @@ class TestStateTransitions(_EnsureRunningBase):
         self.assertNotIn("gs-home-test", self.podman._volumes)
 
 
+class TestModelPrecedence(unittest.TestCase):
+    """TRN-257: per-backend model resolution in the transport.
+
+    Covers each level of the precedence chain
+      dispatch > backend_override > per-agent > backend_default > model.default > built-in
+    that the transport is responsible for.
+
+    The transport owns four of the six levels: the per-backend override (a hard
+    patch, _resolve_backend_model_override) and the fallback default
+    (_resolve_backend_default_model, which folds backend_default > model.default
+    > built-in). The remaining two — dispatch(model=) and per-agent model — are
+    applied by the gateway at/after the config layer and are asserted via the
+    documented relationship (override beats per-agent; per-agent beats the
+    default the transport writes).
+    """
+
+    def setUp(self):
+        import transport.lifecycle as life
+
+        self.life = life
+        # Snapshot the module-level model config so each test restores it.
+        self._saved_override = dict(life._KC_MODEL_BACKEND_OVERRIDE)
+        self._saved_default = dict(life._KC_MODEL_BACKEND_DEFAULT)
+        self._saved_global = life.KC_MODEL_DEFAULT
+
+    def tearDown(self):
+        self.life._KC_MODEL_BACKEND_OVERRIDE = self._saved_override
+        self.life._KC_MODEL_BACKEND_DEFAULT = self._saved_default
+        self.life.KC_MODEL_DEFAULT = self._saved_global
+
+    def _set(self, overrides=None, defaults=None, global_default=""):
+        self.life._KC_MODEL_BACKEND_OVERRIDE = {
+            "kiro": "", "claude": "", "codex": "", **(overrides or {})
+        }
+        self.life._KC_MODEL_BACKEND_DEFAULT = {
+            "kiro": "", "claude": "", "codex": "", **(defaults or {})
+        }
+        self.life.KC_MODEL_DEFAULT = global_default
+
+    # ── backend override (highest operator-controlled level) ──────────────────
+
+    def test_backend_override_returned_for_that_backend(self):
+        self._set(overrides={"kiro": "claude-sonnet-4-5"})
+        self.assertEqual(
+            self.life._resolve_backend_model_override("kiro"), "claude-sonnet-4-5"
+        )
+
+    def test_backend_override_isolated_to_its_backend(self):
+        # kiro override set — claude and codex are unaffected.
+        self._set(overrides={"kiro": "claude-sonnet-4-5"})
+        self.assertEqual(self.life._resolve_backend_model_override("claude"), "")
+        self.assertEqual(self.life._resolve_backend_model_override("codex"), "")
+
+    def test_no_override_returns_empty(self):
+        self._set()
+        self.assertEqual(self.life._resolve_backend_model_override("kiro"), "")
+
+    # ── backend default > global default > built-in ───────────────────────────
+
+    def test_backend_default_beats_global_default(self):
+        self._set(defaults={"kiro": "qwen-dense"}, global_default="gemma")
+        self.assertEqual(self.life._resolve_backend_default_model("kiro"), "qwen-dense")
+        # A backend with no per-backend default falls back to the global one.
+        self.assertEqual(self.life._resolve_backend_default_model("claude"), "gemma")
+
+    def test_global_default_is_final_fallback(self):
+        self._set(global_default="gemma")
+        for backend in ("kiro", "claude", "codex"):
+            self.assertEqual(
+                self.life._resolve_backend_default_model(backend), "gemma"
+            )
+
+    def test_built_in_when_nothing_set(self):
+        self._set()
+        self.assertEqual(self.life._resolve_backend_default_model("kiro"), "")
+
+    def test_override_and_default_are_independent_levels(self):
+        # Override set, default unset: default resolution still returns the
+        # fallback (override is a separate, higher level applied via patch).
+        self._set(overrides={"kiro": "forced"}, global_default="fallback")
+        self.assertEqual(self.life._resolve_backend_model_override("kiro"), "forced")
+        self.assertEqual(
+            self.life._resolve_backend_default_model("kiro"), "fallback"
+        )
+
+    def test_default_model_written_only_when_nonempty(self):
+        # When the resolved fallback is empty, the transport must NOT write
+        # agent.default_model (leaving KiroCrew's built-in intact). The
+        # resolver returning "" is what the lifecycle guard keys on.
+        self._set()
+        self.assertEqual(self.life._resolve_backend_default_model("codex"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── TestPatchFollowsCrewBackend (TRN-259) ─────────────────────────────────────
+
+class _ExecRecorder:
+    """Minimal podman stand-in that records container_exec argv."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def container_exec(self, container, cmd):
+        self.calls.append(cmd)
+        return "ok"
+
+
+class TestPatchFollowsCrewBackend(unittest.TestCase):
+    """_patch_crew_config / _patch_models use the crew's backend, not the
+    transport default."""
+
+    def setUp(self):
+        import transport.lifecycle as life
+        self.life = life
+        self._patchers = [
+            patch.object(life, "GA_CREW_ACP_BACKEND", "claude"),
+            patch.object(life, "_load_crew_manifest", return_value={}),
+            patch.dict(life._KC_MODEL_BACKEND_OVERRIDE,
+                       {"kiro": "kiro-override", "claude": "claude-override"}, clear=True),
+            patch.dict(life._KC_MODEL_BACKEND_DEFAULT,
+                       {"kiro": "kiro-default", "claude": "claude-default"}, clear=True),
+        ]
+        for p in self._patchers:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patchers])
+
+    def _agent_overrides(self, backend):
+        import base64
+        import json
+        rec = _ExecRecorder()
+        self.life._patch_crew_config(rec, "gs-crew-x", backend=backend)
+        return json.loads(base64.b64decode(rec.calls[-1][-1]))["agent"]
+
+    def test_kiro_crew_under_claude_default(self):
+        agent = self._agent_overrides("kiro")
+        self.assertNotIn("acp_backend", agent)
+        self.assertEqual(agent["default_model"], "kiro-default")
+
+    def test_claude_crew(self):
+        agent = self._agent_overrides("claude")
+        self.assertEqual(agent["acp_backend"], "claude")
+        self.assertEqual(agent["default_model"], "claude-default")
+
+    def test_patch_models_uses_crew_backend(self):
+        rec = _ExecRecorder()
+        self.life._patch_models(rec, "gs-crew-x", backend="kiro")
+        self.assertEqual(rec.calls[-1][-1], "kiro-override")
+
+    def test_backend_is_required(self):
+        with self.assertRaises(TypeError):
+            self.life._patch_crew_config(_ExecRecorder(), "gs-crew-x")
+
+
+# ---------------------------------------------------------------------------
+# TRN-260 H-1: inject_policy uses stdin, not argv (secret-delivery-hardening)
+# ---------------------------------------------------------------------------
+
+class TestInjectPolicyStdinDelivery(unittest.TestCase):
+    """Assert that _inject_policy delivers the signing key via stdin, not argv.
+
+    H-1: passing the key as argv exposes it in /proc/<pid>/cmdline.
+    The fix: container_exec_stdin is used and the key does NOT appear in argv.
+    """
+
+    def setUp(self):
+        try:
+            from lifecycle import _inject_policy  # container flat layout
+        except ModuleNotFoundError:
+            from transport.lifecycle import _inject_policy  # local dev
+        self._inject_policy = _inject_policy
+
+    def _make_podman(self):
+        from tests.fakes import FakePodmanClient
+        podman = FakePodmanClient()
+        podman.exec_responses["test-container"] = "policy injected version=1"
+        return podman
+
+    def _patch_policy(self):
+        """Mock Path.read_text so _inject_policy doesn't need /policies/default.json."""
+        import json as _json
+        _fake_policy = _json.dumps({"version": "1", "rules": []})
+        return unittest.mock.patch(
+            "pathlib.Path.read_text", return_value=_fake_policy
+        )
+
+    def test_uses_container_exec_stdin_not_exec_checked(self):
+        """_inject_policy must call container_exec_stdin, not container_exec_checked."""
+        podman = self._make_podman()
+        with self._patch_policy():
+            self._inject_policy(podman, "test-container", "spec-ops", "my-secret-key")
+        call_types = [c[0] for c in podman.calls]
+        self.assertIn("container_exec_stdin", call_types)
+        self.assertNotIn("container_exec_checked", call_types)
+
+    def test_signing_key_not_in_argv(self):
+        """The policy signing key must not appear in any argv element."""
+        secret = "super-secret-hmac-key-12345"
+        podman = self._make_podman()
+        with self._patch_policy():
+            self._inject_policy(podman, "test-container", "spec-ops", secret)
+        for call in podman.calls:
+            if call[0] == "container_exec_stdin":
+                cmd = call[2]  # (type, container, cmd, stdin_data)
+                for arg in cmd:
+                    self.assertNotIn(secret, arg,
+                        f"Signing key found in argv element {arg!r}")
+
+    def test_signing_key_delivered_via_stdin(self):
+        """The signing key must be present in the decoded stdin payload."""
+        import base64, json as _json
+        secret = "super-secret-hmac-key-12345"
+        podman = self._make_podman()
+        with self._patch_policy():
+            self._inject_policy(podman, "test-container", "spec-ops", secret)
+        for call in podman.calls:
+            if call[0] == "container_exec_stdin":
+                stdin_data = call[3]
+                decoded = base64.b64decode(stdin_data.strip()).decode()
+                self.assertIn(secret, decoded,
+                    "Signing key not found in decoded stdin payload")
+
+    def test_payload_is_base64_json_with_key(self):
+        """stdin_data must be base64-decodable JSON containing policy_signing_key."""
+        import base64, json as _json
+        secret = "another-secret-key"
+        podman = self._make_podman()
+        with self._patch_policy():
+            self._inject_policy(podman, "test-container", "spec-ops", secret)
+        for call in podman.calls:
+            if call[0] == "container_exec_stdin":
+                stdin_data = call[3]
+                data = _json.loads(base64.b64decode(stdin_data.strip()).decode())
+                self.assertEqual(data["policy_signing_key"], secret)
+                self.assertIn("policy", data)

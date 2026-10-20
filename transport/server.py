@@ -176,12 +176,12 @@ except ModuleNotFoundError:
     )
 
 try:
-    from config import Config, inert_backend_settings  # container: both files flat in /app
+    from config import Config, api_key_exposure, inert_backend_settings  # container: both files flat in /app
 except ImportError:
     # Local dev: transport/ is a package dir, and a bare `import config` can
     # resolve to the repo-root config/ namespace package (which has no Config),
     # raising ImportError rather than ModuleNotFoundError — fall back either way.
-    from transport.config import Config, inert_backend_settings
+    from transport.config import Config, api_key_exposure, inert_backend_settings
 
 try:
     from registry import (  # container: flat /app/
@@ -376,11 +376,11 @@ except ModuleNotFoundError:
 # directly any more.
 cfg = Config.from_env()
 
-HOST = cfg.host  # Binds all interfaces inside the container.
-# The host-side protection is in install.sh: -p "127.0.0.1:PORT:PORT" ensures
-# the published port is only reachable from localhost on the host, regardless
-# of what the container binds internally. Set HOST=127.0.0.1 only for
-# non-containerised installs where you want loopback-only binding.
+# The transport's own listen address inside its container (GA_TRANSPORT_BIND,
+# fixed at 0.0.0.0 by compose.yml) so ga-portal can reach it as
+# ga-transport:64057. It publishes no host port: exposure is decided solely by
+# where ga-portal publishes (the operator's HOST, cfg.ga_portal_host).
+HOST = cfg.ga_transport_bind
 PORT = cfg.port
 
 # DATA_DIR moved to lifecycle.py (owned there; not used in server.py post-TRN-242).
@@ -418,7 +418,6 @@ GA_IDLE_TIMEOUT_SECS = cfg.ga_idle_timeout_secs
 _KC_AGENT_NAME = "kiro"
 # Retained as GA_CREW_AGENT for existing call sites.
 GA_CREW_AGENT = _KC_AGENT_NAME
-KC_MODEL_OVERRIDE = cfg.kc_model_override
 KC_MODEL_DEFAULT = cfg.kc_model_default
 GA_MIN_FREE_MEM_GB = cfg.ga_min_free_mem_gb
 GA_SPAWN_MIN_MEMORY_GB = cfg.ga_spawn_min_memory_gb
@@ -449,21 +448,10 @@ GA_GIT_AUTHOR_EMAIL = os.environ.get("GA_GIT_AUTHOR_EMAIL", "").strip()
 # "claude": skip kiro auth, inject ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN).
 # "codex": skip kiro auth, inject OPENAI_API_KEY.
 GA_CREW_ACP_BACKEND = cfg.ga_crew_agent.split(",")[0].strip().lower()
-# Crew credentials come from Podman secrets mounted under /run/secrets; the
-# compose template never carries them in its environment block, so the cfg
-# values are "" in production. _security.get_secret prefers the secret file,
-# falls back to the env var for dev/test runs, and registers the value with the
-# redaction filter. lifecycle resolves the same names the same way, so both
-# modules agree on which credential a crew gets (TRN-226).
-_ANTHROPIC_API_KEY = _security.get_secret(
-    "ga-crew-anthropic-api-key", env_var="ANTHROPIC_API_KEY")
+# Credential globals removed (TRN-233 task 2.1) — tools.py resolves credentials
+# per-launch via CredentialStore.get(backend). These stale module-level reads
+# are no longer needed here.
 _ANTHROPIC_BASE_URL = cfg.anthropic_base_url
-# Long-lived token from `claude setup-token`; injected as CLAUDE_CODE_OAUTH_TOKEN
-# when no Anthropic API key is set.
-_CLAUDE_CODE_OAUTH_TOKEN = _security.get_secret(
-    "ga-claude-code-oauth-token", env_var="CLAUDE_CODE_OAUTH_TOKEN")
-_OPENAI_API_KEY = _security.get_secret(
-    "ga-crew-openai-api-key", env_var="OPENAI_API_KEY")
 _OPENAI_BASE_URL = cfg.openai_base_url
 
 # ── Transport security ───────────────────────────────────────────────
@@ -529,63 +517,32 @@ def _load_api_key() -> str:
         "All MCP tools and file endpoints are publicly accessible. "
         "Set GA_API_KEY to require Bearer token auth."
     )
-
-    # Additional bind-address warning when running on a non-loopback interface.
-    # Hard enforcement (refusing to start when GA_REQUIRE_API_KEY=error) lives in
-    # _enforce_require_api_key(), called from the transport startup path — never
-    # here, so that merely importing this module (tests, tooling) cannot abort
-    # the process.
-    # Only emit the informational warning for warn mode; error mode will produce a
-    # proper error message and exit via _enforce_require_api_key, so an extra
-    # warning here would just add noise before the exit.
-    import os as _os
-    _host = _os.environ.get("HOST", "0.0.0.0")
-    if _host not in ("127.0.0.1", "::1", "localhost"):
-        _require = _os.environ.get("GA_REQUIRE_API_KEY", "error")
-        if _require == "warn":
-            _logger.warning(
-                "Transport is bound on %s with no API key — anyone who can "
-                "reach this host can use every MCP tool. Set GA_API_KEY in "
-                "ghostship.conf or use HOST=127.0.0.1 to restrict to loopback.",
-                _host,
-            )
-
     return ""
 
 
-def _enforce_require_api_key(api_key: str) -> None:
-    """Refuse to start the transport unauthenticated on a non-loopback bind.
+def _enforce_api_key_requirement(api_key: str, config: Config | None = None) -> None:
+    """Refuse to start unauthenticated when ga-portal is published beyond loopback.
 
-    Honours GA_REQUIRE_API_KEY (default: ``error``):
+    The check is on the portal's published address (``GA_PORTAL_HOST``, the
+    operator's HOST), never on this process's own in-container listen address,
+    which is always 0.0.0.0. A loopback portal needs no key. A non-loopback
+    portal needs an API key, or the explicit opt-out ``network.api_key: false``
+    (``GA_API_KEY_DISABLED``) — which starts with a WARNING instead.
 
-    - ``error`` (default) — on a non-loopback bind with no API key, log an
-      error and exit non-zero.
-    - ``warn`` — log a warning and continue (backward compatibility).
-    - ``off`` — skip the check entirely (for proxy-protected deployments).
-
-    Loopback binds (127.0.0.1/::1/localhost) are never subject to the check.
     Called from the transport startup path, not at import time, so importing
     this module never terminates the process.
     """
     _logger = logging.getLogger(__name__)
-    import os as _os
     import sys as _sys
 
-    if api_key:
+    verdict = api_key_exposure(api_key, config or cfg)
+    if verdict is None:
         return
-    _host = _os.environ.get("HOST", "0.0.0.0")
-    if _host in ("127.0.0.1", "::1", "localhost"):
+    level, message = verdict
+    if level == "warning":
+        _logger.warning("%s", message)
         return
-    _require = _os.environ.get("GA_REQUIRE_API_KEY", "error")
-    if _require in ("off", "warn"):
-        # off: silent. warn: _load_api_key already logged the warning.
-        return
-    _logger.error(
-        "Refusing to start: transport is bound on %s with no GA_API_KEY. "
-        "Set GA_API_KEY, or set GA_REQUIRE_API_KEY=off to allow "
-        "unauthenticated remote access (for proxy-protected deployments).",
-        _host,
-    )
+    _logger.error("%s", message)
     _sys.exit(1)
 
 
@@ -634,13 +591,11 @@ GA_TRANSPORT_SECRET = _load_transport_secret()
 
 # _auth_file_path, _read_auth_file, _write_auth_file moved to
 # transport.lifecycle alongside _initiate_login; imported below.
-# KIRO_LICENSE / KIRO_IDENTITY_PROVIDER / KIRO_REGION also moved to lifecycle
+# KIRO_IDENTITY_PROVIDER / KIRO_REGION also moved to lifecycle
 # (they drive only the moved _initiate_login device flow).
 
-# When set, kiro-cli authenticates via this API key and the device-code auth
-# flow is skipped entirely. Injected as an env var into crew
-# containers; unset (default) => existing device-code flow is used.
-KIRO_API_KEY = _security.get_secret("ga-kiro-api-key", env_var="KIRO_API_KEY")
+# KIRO_API_KEY global removed (TRN-233 task 2.1) — credentials are now resolved
+# per-launch via CredentialStore.get(backend) in tools.py.
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1613,26 +1568,45 @@ async def _handle_openapi_get(request: Request) -> Response:
 
 
 # ── Login/logout HTTP handlers (extracted to login.py, TRN-242) ──────────────
-# The ten Starlette login/logout route handlers and the three backend helpers
+# The Starlette login/logout route handlers and the three backend helpers
 # (_warn_inert_backend_settings, _backend_enabled, _backend_not_enabled_message)
 # now live in transport.login alongside the LoginFlow singletons they delegate
 # to. Re-exported here so BearerAuthMiddleware wiring in __main__ and existing
 # patch('server.X') test sites keep resolving.
+# TRN-233: new /login/{backend}/{method} and /logout/{backend} handlers added.
 try:
     from login import (  # noqa: F401  re-exported for existing call-sites
         _warn_inert_backend_settings, _backend_enabled, _backend_not_enabled_message,
-        _handle_login_post, _handle_login_get, _handle_logout_post,
+        _handle_login_post, _handle_login_get,
         _handle_claude_login_post, _handle_claude_login_get,
-        _handle_claude_login_code_post, _handle_claude_logout_post,
-        _handle_codex_login_post, _handle_codex_login_get, _handle_codex_logout_post,
+        _handle_claude_login_code_post,
+        _handle_codex_login_post, _handle_codex_login_get,
+        # TRN-233 new routes
+        _handle_login_kiro_get, _handle_login_claude_get_new, _handle_login_codex_get_new,
+        _handle_login_kiro_api_key_post, _handle_login_kiro_builder_id_post,
+        _handle_login_kiro_identity_center_post, _handle_logout_kiro_post,
+        _handle_login_claude_api_key_post, _handle_login_claude_setup_token_post,
+        _handle_login_claude_oauth_post, _handle_login_claude_oauth_code_post,
+        _handle_logout_claude_post_new,
+        _handle_login_codex_api_key_post, _handle_login_codex_chatgpt_post,
+        _handle_logout_codex_post_new,
     )
 except ModuleNotFoundError:
     from transport.login import (  # noqa: F401  local dev
         _warn_inert_backend_settings, _backend_enabled, _backend_not_enabled_message,
-        _handle_login_post, _handle_login_get, _handle_logout_post,
+        _handle_login_post, _handle_login_get,
         _handle_claude_login_post, _handle_claude_login_get,
-        _handle_claude_login_code_post, _handle_claude_logout_post,
-        _handle_codex_login_post, _handle_codex_login_get, _handle_codex_logout_post,
+        _handle_claude_login_code_post,
+        _handle_codex_login_post, _handle_codex_login_get,
+        # TRN-233 new routes
+        _handle_login_kiro_get, _handle_login_claude_get_new, _handle_login_codex_get_new,
+        _handle_login_kiro_api_key_post, _handle_login_kiro_builder_id_post,
+        _handle_login_kiro_identity_center_post, _handle_logout_kiro_post,
+        _handle_login_claude_api_key_post, _handle_login_claude_setup_token_post,
+        _handle_login_claude_oauth_post, _handle_login_claude_oauth_code_post,
+        _handle_logout_claude_post_new,
+        _handle_login_codex_api_key_post, _handle_login_codex_chatgpt_post,
+        _handle_logout_codex_post_new,
     )
 
 
@@ -1672,8 +1646,8 @@ if __name__ == "__main__":
         logger.error("Transport startup aborted — config error: %s", _cfg_err)
         raise SystemExit(1) from _cfg_err
 
-    # Refuse to start unauthenticated on a non-loopback bind (GA_REQUIRE_API_KEY).
-    _enforce_require_api_key(GA_API_KEY)
+    # Refuse to start unauthenticated when ga-portal is published beyond loopback.
+    _enforce_api_key_requirement(GA_API_KEY)
 
     logger.info("Starting transport MCP server on %s:%d", HOST, PORT)
     logger.info("Idle timeout: %ds", GA_IDLE_TIMEOUT_SECS)
@@ -1713,17 +1687,24 @@ if __name__ == "__main__":
     # Generate the OpenAPI schema once, after all routes/tools are defined,
     # before constructing BearerAuthMiddleware. Cached globally so
     # _handle_openapi_get can serve it without re-generating on every request.
+    # TRN-233: old bare /login, /logout, /login/claude, /login/codex paths
+    # removed; new /login/{backend}/{method} and /logout/{backend} registered.
     _openapi_schema_routes = {
-        ("POST", "/login"): _handle_login_post,
-        ("GET",  "/login"): _handle_login_get,
-        ("POST", "/logout"): _handle_logout_post,
-        ("POST", "/login/claude"): _handle_claude_login_post,
-        ("GET",  "/login/claude"): _handle_claude_login_get,
-        ("POST", "/login/claude/code"): _handle_claude_login_code_post,
-        ("POST", "/logout/claude"): _handle_claude_logout_post,
-        ("POST", "/login/codex"): _handle_codex_login_post,
-        ("GET",  "/login/codex"): _handle_codex_login_get,
-        ("POST", "/logout/codex"): _handle_codex_logout_post,
+        ("GET",  "/login/kiro"): _handle_login_kiro_get,
+        ("POST", "/login/kiro/api-key"): _handle_login_kiro_api_key_post,
+        ("POST", "/login/kiro/builder-id"): _handle_login_kiro_builder_id_post,
+        ("POST", "/login/kiro/identity-center"): _handle_login_kiro_identity_center_post,
+        ("POST", "/logout/kiro"): _handle_logout_kiro_post,
+        ("GET",  "/login/claude"): _handle_login_claude_get_new,
+        ("POST", "/login/claude/api-key"): _handle_login_claude_api_key_post,
+        ("POST", "/login/claude/setup-token"): _handle_login_claude_setup_token_post,
+        ("POST", "/login/claude/oauth"): _handle_login_claude_oauth_post,
+        ("POST", "/login/claude/oauth/code"): _handle_login_claude_oauth_code_post,
+        ("POST", "/logout/claude"): _handle_logout_claude_post_new,
+        ("GET",  "/login/codex"): _handle_login_codex_get_new,
+        ("POST", "/login/codex/api-key"): _handle_login_codex_api_key_post,
+        ("POST", "/login/codex/chatgpt"): _handle_login_codex_chatgpt_post,
+        ("POST", "/logout/codex"): _handle_logout_codex_post_new,
         ("GET",  "/health"): _handle_health,
         ("GET",  "/crews/*/ui"): _handle_crew_ui_proxy,
         ("GET",  "/crews/*/api"): _handle_crew_api_proxy,
@@ -1752,16 +1733,21 @@ if __name__ == "__main__":
         api_key=GA_API_KEY,
         file_app=_file_starlette,
         routes={
-            ("POST", "/login"): _handle_login_post,
-            ("GET",  "/login"): _handle_login_get,
-            ("POST", "/logout"): _handle_logout_post,
-            ("POST", "/login/claude"): _handle_claude_login_post,
-            ("GET",  "/login/claude"): _handle_claude_login_get,
-            ("POST", "/login/claude/code"): _handle_claude_login_code_post,
-            ("POST", "/logout/claude"): _handle_claude_logout_post,
-            ("POST", "/login/codex"): _handle_codex_login_post,
-            ("GET",  "/login/codex"): _handle_codex_login_get,
-            ("POST", "/logout/codex"): _handle_codex_logout_post,
+            ("GET",  "/login/kiro"): _handle_login_kiro_get,
+            ("POST", "/login/kiro/api-key"): _handle_login_kiro_api_key_post,
+            ("POST", "/login/kiro/builder-id"): _handle_login_kiro_builder_id_post,
+            ("POST", "/login/kiro/identity-center"): _handle_login_kiro_identity_center_post,
+            ("POST", "/logout/kiro"): _handle_logout_kiro_post,
+            ("GET",  "/login/claude"): _handle_login_claude_get_new,
+            ("POST", "/login/claude/api-key"): _handle_login_claude_api_key_post,
+            ("POST", "/login/claude/setup-token"): _handle_login_claude_setup_token_post,
+            ("POST", "/login/claude/oauth"): _handle_login_claude_oauth_post,
+            ("POST", "/login/claude/oauth/code"): _handle_login_claude_oauth_code_post,
+            ("POST", "/logout/claude"): _handle_logout_claude_post_new,
+            ("GET",  "/login/codex"): _handle_login_codex_get_new,
+            ("POST", "/login/codex/api-key"): _handle_login_codex_api_key_post,
+            ("POST", "/login/codex/chatgpt"): _handle_login_codex_chatgpt_post,
+            ("POST", "/logout/codex"): _handle_logout_codex_post_new,
             ("GET",  "/health"): _handle_health,
             # Crew proxy routes — pattern keys used by BearerAuthMiddleware dispatch
             ("GET",  "/crews/*/api"): _handle_crew_api_proxy,

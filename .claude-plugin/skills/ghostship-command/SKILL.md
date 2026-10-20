@@ -3,7 +3,7 @@ name: ghostship-command
 description: Command a ghostship fleet over the `ghostship` MCP server — launch crew containers, seed and extract workspace files, dispatch OpenSpec work to the six agent personas, poll or steer running tasks, run a crew on autopilot via Captain, and tear crews down. Use whenever the `ghostship` MCP tools (crews, launch, supply, evac, dispatch, pickup, steer, captain, schedule, nuke) are available and there's fleet work to do — this skill has no assumed repo context, it is the context.
 metadata:
   author: ghostship
-  version: "0.7.2"
+  version: "0.8.0"
 ---
 
 # Ghostship Command
@@ -88,7 +88,16 @@ evac(path, crew_id, ...)            → presigned download URL; GET bytes yourse
 nuke(crew_id, confirm=True)         → destroys container + BOTH volumes
 ```
 
-### 1. `launch(crew_id, composition="spec-ops")`
+### 1. `launch(crew_id, composition="spec-ops", backend=None)`
+
+`backend` picks the agent runtime for this crew — `"kiro"`, `"claude"` or
+`"codex"`. Omit it to use the transport default. Different crews can run
+different backends side by side; a crew keeps its backend until it is nuked.
+Only enabled backends are accepted (kiro always; the others when the operator
+listed them in `backends.default`) — anything else returns
+`backend_not_enabled` with the enabled list. If that backend has no stored
+login, `launch` returns `not_authenticated` with a `login_url` for it.
+`crews()` shows each crew's `acp_backend`.
 
 Name `crew_id` after the work — lowercase letters/digits/hyphens, 1–50 chars.
 There's no single required convention; pick whatever makes the crew's purpose
@@ -106,6 +115,14 @@ A crew that idled out (no activity for ~5 min by default) is not gone — the
 next call against it restarts it transparently. Don't `nuke` a crew just
 because `crews()` shows it stopped; `nuke` is for when you want the
 workspace permanently gone.
+
+**Stopped crews consume zero host memory.** A crew with `status: stopped`
+holds only its Podman volume on disk — no containers are running, no
+`kiro-cli-chat` processes exist. Memory pressure comes exclusively from
+*running* crews with active slot processes. Nuking a stopped crew frees no
+memory; it only permanently destroys the workspace. Never nuke to "free up
+memory" — let running crews idle-stop naturally, or reduce active slot
+attachments with `slot=False`.
 
 **`dashboard=True`** allocates a dedicated port and returns a `dashboard_url`
 for the crew's browser UI. The dashboard is opt-in (`dashboard=False` by
@@ -441,6 +458,14 @@ git filter-repo --name-callback 'return b"Your Name"' \
   accounting, and task tracking — silently breaking all of it.
 - **`nuke` destroys both volumes, no residue.** `evac` everything you need
   before nuking. There is no undo.
+- **Always ask the user before nuking.** The Admiral agent MUST get explicit
+  user confirmation before calling `nuke(confirm=True)` on any crew — running
+  or stopped — unless the user has given an unambiguous instruction to nuke
+  that specific crew in the current turn. The `confirm=True` API parameter is
+  a safety guard against accidental tool calls; it does not replace the
+  requirement to check with the user first. Never nuke proactively to free
+  memory, reuse a crew_id, or clean up — stopped crews cost nothing and
+  running crews may have in-progress work.
 - **`nuke(crew_id)` without `confirm=True` is a preview only**, not a no-op.
   Add `confirm=True` to actually destroy.
 - **Rebuilding the crew image doesn't touch existing crews.** A container is
@@ -459,7 +484,7 @@ git filter-repo --name-callback 'return b"Your Name"' \
 | Nuked a crew and lost work | Should have `evac`'d first — no undo |
 | Agent did wrong thing despite timeout steer | Used fresh `dispatch` instead of `steer` — lost full prior context |
 | Captain sending many duplicate admiral mails | Raven correctly reporting completion each cycle; Raven self-pauses on SDD template — check `captain status` for `paused`. For free-form orders, the dedup check prevents most repeats but a manual `captain(action="stop")` may be needed |
-| Host memory pressure / transport rejects new launches | Crews with active tasks each use ~300–400 MB per slot process (`kiro-cli-chat`). Use `slot=False` for unattended SDD/batch work to dispatch headless with no slot process; reserve the default member slot for crews you're actively watching in a dashboard |
+| Host memory pressure / transport rejects new launches | Only *running* crews with active slot processes consume memory (~300–400 MB per `kiro-cli-chat`). Stopped crews use zero memory — do NOT nuke them to relieve pressure. Use `slot=False` for unattended SDD/batch work; let running crews idle-stop naturally. |
 
 ## Worked example — captain autopilot (recommended for non-trivial work)
 

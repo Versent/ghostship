@@ -10,9 +10,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -20,13 +20,13 @@ jobs:
         run: pip install -r transport/requirements.txt
 
       - name: Run tests
-        run: tests/run.sh --unit
+        run: scripts/run.sh --unit
 
       - name: Generate OpenAPI schema (TRN-129)
         run: python scripts/generate_openapi.py --output openapi.json
 
       - name: Upload OpenAPI schema artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openapi-schema
           path: openapi.json
@@ -46,23 +46,23 @@ jobs:
     name: integration-tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run shell integration tests
-        run: tests/run.sh --integration
+        run: scripts/run.sh --integration
 
   security-scan:
     name: security-scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       # TRN-70 secrets-management 1.4 + input-validation 4.4: fail the build on
       # a committed live secret or on string-built SQL.
       - name: Security scan (secrets + unsafe queries)
-        run: python3 tests/security_scan.py
+        run: python3 scripts/security_scan.py
 

@@ -150,12 +150,10 @@ _security.register_secret(_FILE_SECRET)
 def _resolve_public_url_base() -> str:
     """Return the public URL base for presigned file URLs.
 
-    Precedence: GA_HOST_URL > http://localhost:{PORT}.
+    Precedence: GA_HOST_URL > derived from ga-portal's published address
+    (``http://localhost:{PORT}`` for a loopback or wildcard HOST).
     """
-    base = cfg.ga_host_url
-    if base:
-        return base.rstrip("/")
-    return f"http://localhost:{PORT}"
+    return cfg.public_base_url()
 
 
 def _sign_file_url(
@@ -169,7 +167,7 @@ def _sign_file_url(
     expires = int(time.time()) + 300
     flags = ":".join(sorted(f for f in ["bundle", "pack"] if (f == "bundle" and bundle) or (f == "pack" and pack)))
     payload = f"{crew_id}:{path}:{expires}:GET:{ref or ''}:{flags}"
-    sig = hmac.new(_FILE_SECRET.encode(), payload.encode(), digestmod=hashlib.sha256).hexdigest()
+    sig = hmac.HMAC(_FILE_SECRET.encode(), payload.encode(), digestmod=hashlib.sha256).hexdigest()
     base = _resolve_public_url_base()
     url = f"{base}/files/{crew_id}/{path}?expires={expires}&sig={sig}"
     if ref:
@@ -212,7 +210,7 @@ def _verify_file_token(
         # Download (GET) path
         flags = ":".join(sorted(f for f in ["bundle", "pack"] if (f == "bundle" and bundle) or (f == "pack" and pack)))
         payload = f"{crew_id}:{path}:{exp}:GET:{ref or ''}:{flags}"
-    expected = hmac.new(_FILE_SECRET.encode(), payload.encode(), digestmod=hashlib.sha256).hexdigest()
+    expected = hmac.HMAC(_FILE_SECRET.encode(), payload.encode(), digestmod=hashlib.sha256).hexdigest()
     if hmac.compare_digest(expected, sig):
         _security.audit_auth_event(action="verify_file_token", outcome="valid", source=None)
         return True
@@ -230,7 +228,7 @@ def _sign_upload_url(crew_id: str, path: str, unpack: bool = False, bundle: bool
     expires = int(time.time()) + 300
     flags = ":".join(sorted(f for f in ["bundle", "force", "unpack"] if (f == "bundle" and bundle) or (f == "force" and force) or (f == "unpack" and unpack)))
     payload = f"{crew_id}:{path}:{expires}:POST::{flags}"
-    sig = hmac.new(_FILE_SECRET.encode(), payload.encode(), digestmod=hashlib.sha256).hexdigest()
+    sig = hmac.HMAC(_FILE_SECRET.encode(), payload.encode(), digestmod=hashlib.sha256).hexdigest()
     base = _resolve_public_url_base()
     return f"{base}/files/{crew_id}/{path}?expires={expires}&sig={sig}"
 

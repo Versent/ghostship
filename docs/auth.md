@@ -1,163 +1,183 @@
 # Auth & Security
 
+> **Breaking change (TRN-233): backend credentials are no longer set in
+> the config file (`ghostship.yaml` / the retired `ghostship.conf`) or delivered as Podman secrets.** The `ANTHROPIC_API_KEY`,
+> `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY` and `KIRO_API_KEY` config entries
+> are gone, and the installer ignores them with a warning if present. Backend
+> credentials now live in `DATA_DIR/credentials/<backend>.json` and are managed
+> with the `ghostship auth login|logout|status` CLI. **Upgrading drops every
+> stored credential — log in again** with `ghostship auth login <backend>` for
+> each enabled backend (the install wizard offers this automatically). Running
+> crews fail to launch until you do; the first `launch` per backend returns a
+> login URL. `backends.kiro.identity_center.url` / `.region` stay as config —
+> they are the non-secret defaults for the Kiro Identity Center login.
+
+## Managing credentials: `ghostship auth`
+
+All backend auth is driven by one CLI, against the installed transport:
+
+```bash
+ghostship auth login <backend>    # store or replace a credential (kiro|claude|codex)
+ghostship auth logout <backend>   # cancel any pending login and clear the stored credential
+ghostship auth status             # show what is configured for every backend
+```
+
+- `login` presents a numbered **method menu** per backend (or pass `--method`).
+- Secrets are read from a hidden terminal prompt, or from stdin when piped —
+  they never appear in `argv` or in command output.
+- The transport URL and bearer key are **discovered automatically** from the
+  installed containers (Podman inspect), so no flags are needed on a local
+  keyed install. Override with `--url` / `--api-key`, or the `GHOSTSHIP_URL` /
+  `GHOSTSHIP_API_KEY` env vars. Pasted secrets are refused over plain HTTP to a
+  remote host unless `--insecure` is passed.
+- `ghostship auth status --json` emits machine-readable per-backend state
+  (`{backend: {configured, method, stored_at}}`), with no secret values.
+- `ghostship auth logout <backend>` is how you both log out and abort a login.
+  It always ends with no stored credential and no pending login, whatever the
+  starting state. It is idempotent: it returns success with
+  `aborted_pending_login` when it cancelled a flow. It does not touch running
+  crews, so relaunch or nuke them to drop their credential.
+
+Per-backend methods:
+
+| Backend | Methods (`--method`) |
+|:--------|:---------------------|
+| kiro    | `builder-id`, `identity-center`, `api-key` |
+| claude  | `oauth` (Pro/Max authorisation code), `api-key`, `setup-token` |
+| codex   | `chatgpt` (ChatGPT sign-in), `api-key` |
+
 ## Kiro auth
 
 `ga-kiro-auth` is the kiro-cli `auth_kv` payload (base64-encoded JSON), stored at
 `DATA_DIR/ga-kiro-auth` (mode `0600`). `DATA_DIR` is bind-mounted read/write into
 `ga-transport` as `/data`.
 
-### Headless / API key auth (Pro+)
-
-For CI or Pro+ users with a kiro-cli API key, skip the device-code flow entirely.
+### Log in
 
 ```bash
-cp config/ghostship.conf.example config/ghostship.conf
-# Set KIRO_API_KEY="<your-api-key>" in ghostship.conf, then:
-./install.sh --config config/ghostship.conf
-```
+# Builder ID (default, all tiers) — a browser device-code flow:
+ghostship auth login kiro --method builder-id
 
-When `KIRO_API_KEY` is set, `launch` skips `_initiate_login()`, the key is injected
-as `KIRO_API_KEY` into each crew container, and the `inject_auth.py` SQLite step is
-skipped.
-
-### First login
-
-Complete auth before calling `launch`. Any crew created before auth completes is
-unauthenticated and cannot be salvaged — nuke it.
-
-**1. Install with identity provider settings**
-
-```bash
-cp config/ghostship.conf.example config/ghostship.conf
-./install.sh --config config/ghostship.conf
-
-# Or inline:
-./install.sh \
+# IAM Identity Center (org licensing). Flags default to the installed
+# KIRO_IDENTITY_PROVIDER / KIRO_REGION config, and --license pro is added:
+ghostship auth login kiro --method identity-center \
   --identity-provider https://d-xxxxxxxxxx.awsapps.com/start/#/ \
-  --region <region> \
-  --license pro
+  --region <region>
+
+# Pro+ API key (headless, no browser step):
+ghostship auth login kiro --method api-key
 ```
 
-- The start URL **must include `/#/`**.
-- `--license pro` is required for IAM Identity Center.
-
-**2. Trigger the login flow**
-
-```bash
-curl -sX POST http://localhost:64057/login | jq
-```
-
-```json
-{
-  "status": "pending",
-  "login_url": "https://d-xxxxxxxxxx.awsapps.com/start/#/device?user_code=XXXX-XXXX",
-  "code": "XXXX-XXXX"
-}
-```
-
-**3. Open the URL and approve the device** using your org credentials.
-
-**4. Confirm completion**
-
-```bash
-curl -s http://localhost:64057/login | jq .status
-# → "complete"
-```
-
-**5. Launch** — the transport is ready.
+- The Identity Center start URL **must include `/#/`**.
+- Omit `--method` to pick from the menu. For device and authorisation-code
+  flows the CLI prints the activation URL and code, then polls until you
+  approve (or the flow times out).
+- Complete auth before calling `launch`. Any crew created before auth completes
+  is unauthenticated and cannot be salvaged — nuke it.
 
 ### Identity provider config
 
-Resolved in order: `--config` file → CLI flags → interactive prompt.
+The Identity Center login defaults come from `--config` file → CLI flags →
+interactive prompt. These settings stay in `config/ghostship.yaml` (non-secret),
+under `backends.kiro`:
 
-```bash
-# idp.conf
-KIRO_IDENTITY_PROVIDER="https://identitycenter.amazonaws.com/ssoins-abc123"
-KIRO_REGION="us-east-1"
-KIRO_LICENSE="pro"
+```yaml
+# config/ghostship.yaml
+backends:
+  kiro:
+    identity_center:
+      url: "https://identitycenter.amazonaws.com/ssoins-abc123"
+      region: "us-east-1"
 ```
 
 ```bash
 ./install.sh --config ./idp.conf
+# then: ghostship auth login kiro --method identity-center
 ```
 
 ### Uninstall retention
 
-`uninstall.sh` keeps `ga-kiro-auth` so a later install can reuse the login. Pass `--purge-auth` to remove it too.
+`uninstall.sh` keeps `ga-kiro-auth` **and `DATA_DIR/credentials/`** so a later
+install can reuse the logins. Pass `--purge-auth` to remove both.
 
 ### Secret rotation
 
-When tokens expire: `POST /logout` to clear stale auth, then `POST /login` for fresh tokens. Running crews receive fresh auth immediately — no nuke or relaunch needed.
+When tokens expire: `ghostship auth logout kiro` to clear stale auth, then
+`ghostship auth login kiro` for fresh tokens. When the new login completes, its
+auth is injected into running kiro crews. Logout itself leaves running crews
+unchanged; relaunch or nuke a crew to drop the credential it launched with.
 
 ### Auth API
 
-Three HTTP endpoints on the MCP port. Not MCP tools — agents cannot call them. Require `Authorization: Bearer <key>` when `GA_API_KEY` is set.
+Three HTTP endpoints on the MCP port. Not MCP tools — agents cannot call them. Require `Authorization: Bearer <key>` when `GA_API_KEY` is set. The CLI drives these for you. All login paths are `POST /login/{backend}/{method}`; status is `GET /login/{backend}`; logout is `POST /logout/{backend}`.
 
 ```
-UNAUTHENTICATED  ──[POST /login]──►  PENDING  ──[GET /login → complete]──►  AUTHENTICATED
-                                                                                    │
-                ◄──────────────────────────────────[POST /logout]──────────────────┘
+UNAUTHENTICATED  ──[POST /login/kiro/builder-id]──►  PENDING  ──[GET /login/kiro → complete]──►  AUTHENTICATED
+                                                                                                       │
+                ◄──────────────────────────────[POST /logout/kiro]────────────────────────────────────┘
 ```
 
-**`POST /login`** — starts device auth, returns `login_url` and `code`. Returns 409 if already authenticated.
+**`POST /login/kiro/builder-id`** / **`POST /login/kiro/identity-center`** — start the device / Identity Center flow and return `login_url` and `code`. Identity Center takes `{start_url?, region?}`, defaulting to the configured `KIRO_IDENTITY_PROVIDER` / `KIRO_REGION`, adds `--license pro`, and returns 400 if a value is still missing. **`POST /login/kiro/api-key`** stores a pasted Pro+ key. Completion replaces any existing credential (no 409).
 
-**`GET /login`** — polls completion. On success writes `ga-kiro-auth`, injects auth into all running crews, returns `complete`.
+**`GET /login/kiro`** — polls completion and returns status plus any pending flow and the configured Identity Center defaults. On success writes `ga-kiro-auth`, injects auth into running kiro crews (not claude or codex crews), returns `complete`.
 
-**`POST /logout`** — deletes `ga-kiro-auth` and clears auth from every running crew.
+**`POST /logout/kiro`** — cancels any pending flow (removing its login container), then removes the stored credential and the legacy `ga-kiro-auth` file. Returns `200 {"status": "logged_out"}`, adding `"aborted_pending_login": true` when a flow was cancelled. Idempotent: with nothing stored or pending it still returns 200. Returns 500 if the credential cannot be deleted, or if podman is unavailable so a pending login cannot be cancelled (the credential is still removed). Running crews are not touched: they keep the credential they launched with until relaunched or nuked.
 
 ---
 
-## Claude headless auth (recommended)
+## Claude auth
 
-For unattended and server deployments, give the transport a long-lived Claude token
-instead of logging in through the browser. The token comes from `claude setup-token`,
-which you run once on your own machine. It is delivered like `KIRO_API_KEY`: set in
-`ghostship.conf`, stored as the Podman secret `ga-claude-code-oauth-token`, and injected
-into each Claude-backend crew as `CLAUDE_CODE_OAUTH_TOKEN`. Every crew uses the same
-token, so the OAuth refresh problem described under
-[Re-authenticate](#re-authenticate) does not apply.
+Claude-backend crews authenticate with a credential stored by the transport and
+resolved per launch. Pick a method with `ghostship auth login claude`:
+
+| Method | For |
+|:-------|:----|
+| `setup-token` | Unattended/server deployments. A long-lived token from `claude setup-token`, run once on your own machine. Every crew uses the same token, so the OAuth staleness under [Re-authenticate](#re-authenticate) does not apply. **Recommended.** |
+| `api-key` | Anthropic pay-per-token API key. |
+| `oauth` | Claude Pro/Max subscription, interactive authorisation-code flow (below). |
 
 ### Prerequisites
 
-Enable the Claude backend by adding `claude` to `GA_CREW_AGENT` in your
-`ghostship.conf`.
+Enable the Claude backend by adding `claude` to `backends.agent` in your
+`config/ghostship.yaml` and re-running `ghostship install`, which builds the `claude`
+CLI into the crew image. Login works whenever `claude` is enabled, even while
+another backend is the default.
 
-### Authenticate
+### Setup-token (headless, recommended)
 
-1. On your own machine, run `claude setup-token`, approve in the browser, and copy
-   the token it prints.
-2. Add it to `ghostship.conf`:
+1. On your own machine, run `claude setup-token`, approve in the browser, and
+   copy the token it prints.
+2. Store it in the transport:
 
    ```bash
-   CLAUDE_CODE_OAUTH_TOKEN="<token>"
+   ghostship auth login claude --method setup-token
+   # paste the token at the hidden prompt (or pipe it on stdin)
    ```
 
-3. Re-run `ghostship install`. New Claude-backend crews launch without a login
-   prompt.
-
-`install.sh` ignores a `CLAUDE_CODE_OAUTH_TOKEN` exported in your shell. Only the
-value in `ghostship.conf` is used.
+New Claude-backend crews launch without a login prompt. The token is never
+written to the config file and never appears in command output.
 
 ### Rotate
 
-The token is long-lived but does expire. When crews start failing Claude auth, run
-`claude setup-token` again, replace the value in `ghostship.conf`, and re-run
-`ghostship install`. The token is fixed in a crew's environment when the crew is
-created, so evac and relaunch existing Claude-backend crews to pick up the new one.
+The token is long-lived but does expire. When crews start failing Claude auth,
+run `claude setup-token` again and re-run `ghostship auth login claude --method
+setup-token`. The credential is resolved per launch, so new and relaunched crews
+pick up the new value with no restart.
 
 ## Claude OAuth login (interactive)
 
 `ga-claude-auth` is a tar archive of `~/.claude/` (the credential directory written
 by the `claude` CLI), stored at `DATA_DIR/ga-claude-auth` (mode `0600`).
 
-This path is an alternative to `ANTHROPIC_API_KEY` for operators with a
+This method (`ghostship auth login claude --method oauth`) is for operators with a
 Claude Pro/Max subscription who prefer not to maintain a separate API-tier account.
-For unattended or server deployments, prefer the headless auth path above.
+For unattended or server deployments, prefer the setup-token method above. The CLI
+drives the HTTP flow below for you; the raw endpoints are documented for reference.
 
 ### Prerequisites
 
-1. Enable the Claude backend: add `claude` to `GA_CREW_AGENT` in your
-   `ghostship.conf` and re-run `ghostship install`, which builds the `claude` CLI
+1. Enable the Claude backend: add `claude` to `backends.agent` in your
+   `config/ghostship.yaml` and re-run `ghostship install`, which builds the `claude` CLI
    into the crew image.
 2. To make Claude the default for new crews, also set `GA_CREW_AGENT=claude` (deprecated alias: `GA_CREW_ACP_BACKEND=claude`).
    Login works whenever `claude` is enabled, even while another backend is the
@@ -235,23 +255,23 @@ curl -sX POST http://localhost:64057/login/claude | jq
 curl -sX POST http://localhost:64057/logout/claude
 ```
 
-This deletes `ga-claude-auth` and runs `rm -rf ~/.claude/` inside every running
-Claude-backend crew. Existing crew sessions become unauthenticated; relaunch them
-after logging in again.
+This cancels any pending Claude login, then deletes the stored credential (and
+`ga-claude-auth`, if present). It is idempotent. Running Claude-backend crews are
+not touched: they keep the credential they launched with, so relaunch or nuke a
+crew to drop it.
 
 ### Credential precedence
 
-Each Claude-backend crew gets exactly one credential, chosen in this order:
+Each Claude-backend crew gets exactly one credential from the store, chosen by the
+method recorded for the `claude` backend:
 
-1. `ANTHROPIC_API_KEY`.
-2. `CLAUDE_CODE_OAUTH_TOKEN`.
-3. `ga-claude-auth`, copied into the crew's `~/.claude/`.
+1. `api-key` (Anthropic API key).
+2. `setup-token` (`CLAUDE_CODE_OAUTH_TOKEN`).
+3. `oauth` (`ga-claude-auth`, copied into the crew's `~/.claude/`).
 
-The two settings are passed to the crew under the same names. Before TRN-226 the
-API key setting was `GA_CREW_ANTHROPIC_API_KEY`; that name still works with a
-deprecation warning.
-
-A lower entry is only used when every entry above it is unset.
+There is one active credential per backend — logging in with a new method replaces
+the previous one. `backends.claude.base_url` (`ANTHROPIC_BASE_URL`, non-secret) may still be set in
+`config/ghostship.yaml` to point at a proxy.
 
 ### Claude OAuth API
 
@@ -278,24 +298,25 @@ returns `{"status": "complete"}`. Returns `{"status": "pending"}` while waiting.
 Returns 404 if no flow is in progress, and 410 `{"status": "expired"}` when a
 submitted code did not complete within 120 seconds.
 
-**`POST /logout/claude`** — deletes `ga-claude-auth` and wipes `~/.claude/` from
-every running Claude-backend crew. Returns 409 if not authenticated via OAuth.
+**`POST /logout/claude`** — cancels any pending flow (removing its login container), then removes the stored credential and `ga-claude-auth`. Returns `200 {"status": "logged_out"}`, with `"aborted_pending_login": true` when a flow was cancelled. Idempotent: with nothing stored or pending it still returns 200. Returns 500 if the credential cannot be deleted, or if podman is unavailable so a pending login cannot be cancelled (the credential is still removed). Running crews are not touched.
 
 ---
 
-## Codex OAuth login (TRN-172)
+## Codex ChatGPT login (TRN-172, TRN-233)
 
 `ga-codex-auth` is a tar archive of `~/.codex/` (the credential directory holding
 `auth.json`, written by the Codex login flow), stored at `DATA_DIR/ga-codex-auth`
 (mode `0600`).
 
-This path is an alternative to `OPENAI_API_KEY` for operators with a
-ChatGPT subscription who prefer not to maintain a separate API-tier account.
+Run `ghostship auth login codex` and pick a method: `api-key` (OpenAI
+pay-per-token key) or `chatgpt` (ChatGPT sign-in, for operators with a ChatGPT
+subscription who prefer not to maintain a separate API-tier account). The CLI
+drives the HTTP flow below for you.
 
 ### Prerequisites
 
-1. Enable the Codex backend: add `codex` to `GA_CREW_AGENT` in your
-   `ghostship.conf` and re-run `ghostship install`, which builds the `codex-acp`
+1. Enable the Codex backend: add `codex` to `backends.agent` in your
+   `config/ghostship.yaml` and re-run `ghostship install`, which builds the `codex-acp`
    adapter into the crew image (ONE package — it ships its own Codex binary).
 2. To make Codex the default for new crews, also set `GA_CREW_AGENT=codex` (deprecated alias: `GA_CREW_ACP_BACKEND=codex`).
    Login works whenever `codex` is enabled, even while another backend is the
@@ -351,14 +372,17 @@ curl -sX POST http://localhost:64057/login/codex | jq
 curl -sX POST http://localhost:64057/logout/codex
 ```
 
-This deletes `ga-codex-auth` and runs `rm -rf ~/.codex/` inside every running
-Codex-backend crew. Existing crew sessions become unauthenticated; relaunch them
-after logging in again.
+This cancels any pending Codex login, then deletes the stored credential (and
+`ga-codex-auth`, if present). It is idempotent. Running Codex-backend crews are
+not touched: they keep the credential they launched with, so relaunch or nuke a
+crew to drop it.
 
 ### Credential precedence
 
-When both `OPENAI_API_KEY` and `ga-codex-auth` are present, the API key
-takes precedence. OAuth credentials are only used when the API key is unset.
+There is one active credential per backend. Logging in with `--method api-key`
+replaces a stored `chatgpt` credential and vice versa — the method recorded for
+the `codex` backend is the one used. `backends.codex.base_url` (`OPENAI_BASE_URL`, non-secret) may still be
+set in `config/ghostship.yaml` to point at a proxy.
 
 ### Codex OAuth API
 
@@ -380,19 +404,29 @@ Returns 409 if already authenticated or a flow is in progress, and 400 if
 returns `{"status": "complete"}`. Returns `{"status": "pending"}` while waiting.
 Returns 404 if no flow is in progress.
 
-**`POST /logout/codex`** — deletes `ga-codex-auth` and wipes `~/.codex/` from
-every running Codex-backend crew. Idempotent: returns 200 even when already
-unauthenticated (nothing to clear).
+**`POST /logout/codex`** — cancels any pending flow (removing its login container), then removes the stored credential and `ga-codex-auth`. Returns `200 {"status": "logged_out"}`, with `"aborted_pending_login": true` when a flow was cancelled. Idempotent: with nothing stored or pending it still returns 200. Returns 500 if the credential cannot be deleted, or if podman is unavailable so a pending login cannot be cancelled (the credential is still removed). Running crews are not touched.
 
 ---
 
-An optional static bearer credential protecting the MCP endpoint.
+An optional static bearer credential protecting the MCP endpoint. Set it in
+`config/ghostship.yaml` or on the command line (the flag wins and is saved for
+later installs):
+
+```yaml
+network:
+  api_key: "<your-secret-key>"
+```
 
 ```bash
 ./install.sh --api-key <your-secret-key>
 ```
 
-The key is delivered as a Podman secret — never as an environment variable. To disable: `./install.sh --api-key ""`.
+The key is delivered as a Podman secret — never as an environment variable. `./install.sh --api-key ""` clears the saved flag key.
+
+A key is optional while `network.host` is loopback (the default, `127.0.0.1`).
+For any other host the install aborts without one, unless you opt out
+explicitly with `network.api_key: false` — for deployments that put their own
+auth layer in front (Tailscale, VPN, reverse proxy).
 
 To rotate: `./install.sh --api-key <new-key>` — rewrites the file, recreates the secret, restarts the transport (~2s). Update all MCP clients with the new bearer token.
 
@@ -456,7 +490,7 @@ Browser ──GET :64058/──▶ ga-portal
 - **Redaction.** `SecretRedactionFilter` is installed on the root logger at startup. Any value passed to `security.register_secret` is scrubbed from every log record and error.
 - **Admiral private key never enters the container.** No key material passes through a `podman exec` argument list or appears in `/proc/<pid>/cmdline`.
 - **`crews.json` stores identifiers only.** Non-reversible `sha256:<hex[:16]>` fingerprints only — never plaintext secrets.
-- **CI secret scan.** `tests/security_scan.py` runs in the `security-scan` CI job and fails the build on a likely committed live secret.
+- **CI secret scan.** `scripts/security_scan.py` runs in the `security-scan` CI job and fails the build on a likely committed live secret.
 
 ### Rotating `GA_API_KEY`
 
@@ -480,27 +514,34 @@ HTTPS redirect is handled unconditionally by Caddy. Minimum TLS is 1.2.
 
 - `security.validate_str` checks type, length, and format server-side, independent of client checks.
 - All `auth_kv` access uses parameterized SQL — no string-built queries.
-- `tests/security_scan.py` flags string-built SQL and fails the build.
+- `scripts/security_scan.py` flags string-built SQL and fails the build.
 
 ---
 
 ## Using the CLI
 
 ```bash
-# Start the device auth flow: prints an activation URL + code, then polls
-# until you complete authentication (or the flow times out after ~5 min).
-ghostship auth login
+# Store or replace a credential for a backend. Presents a method menu (or pass
+# --method); for device/authorisation-code flows it prints the URL + code and
+# polls until you approve or the flow times out (~5 min).
+ghostship auth login <backend>      # kiro | claude | codex
 
-# Revoke the current transport session.
-ghostship auth logout
+# Cancel any pending login and clear the stored credential for a backend.
+ghostship auth logout <backend>
+
+# Show per-backend credential status (add --json for machine-readable output).
+ghostship auth status
 ```
 
-Both commands accept `--url` / `--api-key` for non-default or remote transports:
+URL and key are discovered from the installed containers, so no flags are needed
+on a local keyed install. Override for non-default or remote transports:
 
 ```bash
-ghostship auth login --url https://remote.example.com --api-key <key>
+ghostship auth login claude --url https://remote.example.com --api-key <key>
 ```
 
-The transport URL is resolved as `--url` > `GHOSTSHIP_URL` env var >
-`http://localhost:64057`. The transport must be running; `auth login` fails
-immediately (with the URL it tried) if it is unreachable.
+Resolution order is `--url` flag > `GHOSTSHIP_URL` env var > the installed port
+(via Podman inspect) > `http://localhost:64057`; the bearer key follows the same
+order with `GHOSTSHIP_API_KEY`. The transport must be running; the command fails
+immediately (naming the URL it tried) if it is unreachable. Pasted secrets are
+refused over plain HTTP to a remote host unless `--insecure` is passed.

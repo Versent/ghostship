@@ -127,8 +127,14 @@ class TestConfigDefaults(unittest.TestCase):
     def setUp(self):
         self.cfg = Config()
 
-    def test_host_default(self):
-        self.assertEqual(self.cfg.host, "0.0.0.0")
+    def test_transport_bind_default(self):
+        self.assertEqual(self.cfg.ga_transport_bind, "0.0.0.0")
+
+    def test_portal_host_default_is_loopback(self):
+        self.assertEqual(self.cfg.ga_portal_host, "127.0.0.1")
+
+    def test_api_key_not_disabled_by_default(self):
+        self.assertFalse(self.cfg.ga_api_key_disabled)
 
     def test_port_default(self):
         self.assertEqual(self.cfg.port, 64057)
@@ -181,10 +187,20 @@ class TestConfigFromEnv(unittest.TestCase):
             cfg = Config.from_env()
         self.assertEqual(cfg.port, 9000)
 
-    def test_host_from_env(self):
+    def test_host_env_does_not_set_transport_bind(self):
+        # HOST is ga-portal's published address; the transport never reads it.
         with patch.dict("os.environ", {"HOST": "127.0.0.1"}):
             cfg = Config.from_env()
-        self.assertEqual(cfg.host, "127.0.0.1")
+        self.assertEqual(cfg.ga_transport_bind, "0.0.0.0")
+
+    def test_portal_host_and_opt_out_from_env(self):
+        with patch.dict(
+            "os.environ",
+            {"GA_PORTAL_HOST": "192.168.1.10", "GA_API_KEY_DISABLED": "true"},
+        ):
+            cfg = Config.from_env()
+        self.assertEqual(cfg.ga_portal_host, "192.168.1.10")
+        self.assertTrue(cfg.ga_api_key_disabled)
 
     def test_ga_max_crews_from_env(self):
         with patch.dict("os.environ", {"GA_MAX_CREWS": "5"}):
@@ -450,25 +466,30 @@ class TestValidateCaddyTlsMode(unittest.TestCase):
 
 
 class TestConfigRepr(unittest.TestCase):
-    """Config.__repr__ masks secret fields."""
+    """Config.__repr__ masks secret fields.
 
-    def test_anthropic_api_key_masked(self):
+    After TRN-233, backend credential fields (anthropic_api_key,
+    openai_api_key, claude_code_oauth_token) are no longer in _SECRET_FIELDS
+    because credentials are managed by CredentialStore, not Config. Only
+    kiro_api_key (the transport bearer key) remains masked.
+    """
+
+    def test_anthropic_api_key_not_masked_after_trn233(self):
+        # Credential fields are no longer secret in Config — CredentialStore owns them.
         cfg = Config(anthropic_api_key="sk-real-key")
-        self.assertNotIn("sk-real-key", repr(cfg))
-        self.assertIn("***", repr(cfg))
+        self.assertIn("sk-real-key", repr(cfg))
 
-    def test_openai_api_key_masked(self):
+    def test_openai_api_key_not_masked_after_trn233(self):
         cfg = Config(openai_api_key="sk-openai-key")
-        self.assertNotIn("sk-openai-key", repr(cfg))
-        self.assertIn("***", repr(cfg))
+        self.assertIn("sk-openai-key", repr(cfg))
 
     def test_kiro_api_key_masked(self):
         cfg = Config(kiro_api_key="kiro-super-secret")
         self.assertNotIn("kiro-super-secret", repr(cfg))
 
-    def test_claude_code_oauth_token_masked(self):
+    def test_claude_code_oauth_token_not_masked_after_trn233(self):
         cfg = Config(claude_code_oauth_token="oauth-token")
-        self.assertNotIn("oauth-token", repr(cfg))
+        self.assertIn("oauth-token", repr(cfg))
 
     def test_empty_secret_fields_not_masked(self):
         """Empty secret fields show '' not '***'."""
@@ -478,7 +499,7 @@ class TestConfigRepr(unittest.TestCase):
         self.assertIn("anthropic_api_key=''", r)
 
     def test_non_secret_field_visible(self):
-        cfg = Config(host="1.2.3.4")
+        cfg = Config(ga_portal_host="1.2.3.4")
         self.assertIn("1.2.3.4", repr(cfg))
 
 
@@ -547,5 +568,222 @@ class TestEnvBoolHelpers(unittest.TestCase):
         self.assertTrue(result)
 
 
+# ── Config ↔ ghostship.yaml.example sync invariant (TRN-253) ──────────────────
+
+
+class TestConfigYamlExampleSync(unittest.TestCase):
+    """Every Config dataclass field must have a documented entry in
+    config/ghostship.yaml.example.
+
+    TRN-253 replaced the flat ghostship.conf.example with a structured YAML
+    example. The invariant is enforced through bin/lib/yaml_config.py's
+    canonical env-var -> YAML-path map: every Config field maps to an env var,
+    every env var maps to a YAML path, and that path's leaf key must appear in
+    the example file. This keeps the installer's config surface (yaml_config),
+    the transport's config surface (Config), and the operator documentation
+    (yaml.example) in lock-step.
+    """
+
+    # Config fields the installer deliberately does NOT surface in the YAML
+    # config: backend credentials are managed by `ghostship auth login` and
+    # resolved per launch (TRN-233), never set in the config file.
+    _CREDENTIAL_FIELDS = frozenset(
+        {
+            "anthropic_api_key",
+            "openai_api_key",
+            "kiro_api_key",
+            "claude_code_oauth_token",
+        }
+    )
+
+    # Config fields install.sh derives rather than reads 1:1 from the YAML
+    # (portal-only-host): the transport's fixed listen address, the operator's
+    # network.host passed through as GA_PORTAL_HOST, and network.api_key: false
+    # passed through as GA_API_KEY_DISABLED. Their YAML keys are network.host and
+    # network.api_key, checked directly below.
+    _INSTALLER_DERIVED_FIELDS = frozenset(
+        {"ga_transport_bind", "ga_portal_host", "ga_api_key_disabled"}
+    )
+
+    @staticmethod
+    def _load_yaml_config_module():
+        import importlib.util
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[2]
+        mod_path = repo_root / "bin" / "lib" / "yaml_config.py"
+        spec = importlib.util.spec_from_file_location("yaml_config", mod_path)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod, repo_root
+
+    def test_every_config_field_has_yaml_example_entry(self):
+        import dataclasses
+        import re
+
+        yc, repo_root = self._load_yaml_config_module()
+        example = (repo_root / "config" / "ghostship.yaml.example").read_text()
+
+        # Config field name -> env var. Field names mirror env var names
+        # lowercased (module docstring), except host/port which drop the GA_
+        # prefix. Build the lowercase->ENV lookup from yaml_config.DEFAULTS.
+        env_by_lower = {name.lower(): name for name in yc.DEFAULTS}
+
+        missing = []
+        for field in dataclasses.fields(Config):
+            fname = field.name
+            if fname.startswith("_"):
+                continue
+            if fname in self._CREDENTIAL_FIELDS | self._INSTALLER_DERIVED_FIELDS:
+                continue
+            env = env_by_lower.get(fname)
+            self.assertIsNotNone(
+                env,
+                f"Config field '{fname}' has no matching env var in "
+                f"yaml_config.DEFAULTS — add it to both DEFAULTS and _KEY_MAP.",
+            )
+            path = yc._ENV_TO_PATH.get(env)
+            self.assertIsNotNone(
+                path,
+                f"env var '{env}' (Config.{fname}) is not in yaml_config._KEY_MAP.",
+            )
+            leaf = path[-1]
+            if not re.search(rf"^\s*#?\s*{re.escape(leaf)}:", example, re.M):
+                missing.append(f"{fname} -> {'.'.join(path)}")
+
+        self.assertEqual(
+            missing,
+            [],
+            "Config fields missing a commented entry in ghostship.yaml.example: "
+            + ", ".join(missing),
+        )
+
+    def test_yaml_example_parses_when_decommented(self):
+        """The example file is valid YAML and contains the expected structure.
+
+        Since ghostship.yaml.example is now live YAML (not a fully-commented
+        template), we parse it directly and spot-check key sections survive.
+        Guards against accidentally writing invalid YAML in the example.
+        """
+        import yaml
+
+        _yc, repo_root = self._load_yaml_config_module()
+        raw = (repo_root / "config" / "ghostship.yaml.example").read_text()
+
+        parsed = yaml.safe_load(raw)
+        self.assertIsInstance(parsed, dict)
+        # Spot-check a selection of nested keys (TRN-257 structure).
+        self.assertIn("network", parsed)
+        self.assertEqual(parsed["network"]["port"], 64057)
+        self.assertIn("tls", parsed["network"])
+        self.assertIn("crew", parsed)
+        self.assertIn("memory", parsed["crew"])
+        self.assertIn("author", parsed["crew"]["git"])
+        self.assertIn("backends", parsed)
+        # backends.default is now a YAML list; model.override removed globally.
+        self.assertIsInstance(parsed["backends"]["default"], list)
+        self.assertIn("model", parsed["backends"]["kiro"])
+        self.assertIn("identity_center", parsed["backends"]["kiro"])
+        self.assertNotIn("override", parsed["model"])
+        self.assertIn("portal", parsed)
+        self.assertIn("rate_limit", parsed["portal"])
+        self.assertIn("port_range", parsed["portal"]["dashboard"])
+        self.assertIn("machine", parsed)
+        self.assertIn("resources", parsed["machine"])
+        # images merged into machine (was a top-level section before TRN-257).
+        self.assertIn("images", parsed["machine"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── portal-only-host: public URL fallback and exposure enforcement ────────────
+
+
+class TestPortalOnlyHost(unittest.TestCase):
+    def test_is_loopback(self):
+        from transport.config import is_loopback
+
+        for host in ("", "127.0.0.1", "127.9.9.9", "::1", "[::1]", "localhost"):
+            self.assertTrue(is_loopback(host), host)
+        for host in ("0.0.0.0", "::", "192.168.1.10", "example.com"):
+            self.assertFalse(is_loopback(host), host)
+
+    def test_public_base_url_prefers_ga_host_url(self):
+        cfg = Config(ga_host_url="https://academy.example.com/", ga_portal_host="192.168.1.10")
+        self.assertEqual(cfg.public_base_url(), "https://academy.example.com")
+
+    def test_public_base_url_loopback_or_wildcard_is_localhost(self):
+        for host in ("127.0.0.1", "::1", "0.0.0.0", "::", ""):
+            self.assertEqual(
+                Config(ga_portal_host=host).public_base_url(),
+                "http://localhost:64057",
+                host,
+            )
+
+    def test_public_base_url_specific_host(self):
+        self.assertEqual(
+            Config(ga_portal_host="192.168.1.10").public_base_url(),
+            "http://192.168.1.10:64057",
+        )
+        self.assertEqual(
+            Config(ga_portal_host="2001:db8::1").public_base_url(),
+            "http://[2001:db8::1]:64057",
+        )
+
+    def test_presigned_urls_use_public_base_url(self):
+        # transport.files cannot be imported in the unit env; check the wiring.
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[2] / "transport" / "files.py").read_text()
+        self.assertIn("return cfg.public_base_url()", src)
+
+    def test_crew_cors_origin_uses_public_base_url(self):
+        # The CORS origin injected into crews is derived from public_base_url(),
+        # so it follows GA_HOST_URL, then the portal host.
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[2] / "transport" / "tools.py").read_text()
+        self.assertIn("_urlparse(cfg.public_base_url())", src)
+        self.assertNotIn('_transport_public_origin = f"http://localhost:{PORT}"', src)
+
+
+class TestApiKeyExposure(unittest.TestCase):
+    """Startup check is on ga-portal's published address, not the listen address."""
+
+    def test_wildcard_listen_with_loopback_portal_starts(self):
+        from transport.config import api_key_exposure
+
+        cfg = Config(ga_transport_bind="0.0.0.0", ga_portal_host="127.0.0.1")
+        self.assertIsNone(api_key_exposure("", cfg))
+
+    def test_non_loopback_portal_without_key_is_an_error(self):
+        from transport.config import api_key_exposure
+
+        level, message = api_key_exposure("", Config(ga_portal_host="0.0.0.0"))
+        self.assertEqual(level, "error")
+        self.assertIn("network.api_key: false", message)
+
+    def test_non_loopback_portal_with_opt_out_warns(self):
+        from transport.config import api_key_exposure
+
+        cfg = Config(ga_portal_host="192.168.1.10", ga_api_key_disabled=True)
+        level, message = api_key_exposure("", cfg)
+        self.assertEqual(level, "warning")
+        self.assertIn("without authentication", message)
+
+    def test_non_loopback_portal_with_key_starts(self):
+        from transport.config import api_key_exposure
+
+        self.assertIsNone(api_key_exposure("s3cret", Config(ga_portal_host="0.0.0.0")))
+
+    def test_server_exits_on_error_verdict(self):
+        # transport.server cannot be imported in the unit env; check the wiring.
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[2] / "transport" / "server.py").read_text()
+        self.assertIn("verdict = api_key_exposure(api_key, config or cfg)", src)
+        self.assertIn("_enforce_api_key_requirement(GA_API_KEY)", src)
+        self.assertNotIn('environ.get("HOST"', src)

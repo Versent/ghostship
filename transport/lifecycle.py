@@ -42,6 +42,11 @@ except ModuleNotFoundError:
     from transport import security as _security
 
 try:
+    from credentials import CredentialStore  # container: flat /app/
+except ImportError:
+    from transport.credentials import CredentialStore  # local dev
+
+try:
     from podman import (  # container: flat /app/
         PodmanClient,
         _get_podman,
@@ -146,18 +151,14 @@ logger = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 cfg = Config.from_env()
 
-# When set, kiro-cli in the crew authenticates via this API key (injected
-# as a container env var by server.launch) and the SQLite auth-row injection
-# (_inject_auth) is skipped. Unset (default) => device-code auth is injected.
-# Read from the Podman secret, as server.py does: cfg.kiro_api_key is "" in
-# production because the compose file never carries the key (TRN-226).
-KIRO_API_KEY = _security.get_secret("ga-kiro-api-key", env_var="KIRO_API_KEY")
+# Credential store — resolved per-launch via store.get(backend) in launcher.py
+# (TRN-233 task 2.1). KIRO_API_KEY and the anthropic/openai globals removed.
+_cred_store = CredentialStore()
 
 # The reusable kiro-cli auth blob lives under the transport data mount; the
 # KIRO_* values drive the interactive `kiro-cli login` device flow in _initiate_login.
 DATA_DIR = Path("/data")
 GA_AUTH_FILE = "ga-kiro-auth"
-KIRO_LICENSE = cfg.kiro_license
 KIRO_IDENTITY_PROVIDER = cfg.kiro_identity_provider
 KIRO_REGION = cfg.kiro_region
 
@@ -217,8 +218,41 @@ GA_IDLE_TIMEOUT_SECS = cfg.ga_idle_timeout_secs
 _KC_AGENT_NAME = "kiro"
 # Retained as GA_CREW_AGENT for existing call sites in _patch_crew_config.
 GA_CREW_AGENT = _KC_AGENT_NAME
-KC_MODEL_OVERRIDE = cfg.kc_model_override
 KC_MODEL_DEFAULT = cfg.kc_model_default
+# Per-backend model knobs (TRN-257). Keyed by backend name so the precedence
+# chain can be resolved for whichever backend a crew runs on.
+_KC_MODEL_BACKEND_OVERRIDE: dict[str, str] = {
+    "kiro": cfg.kc_model_kiro_override,
+    "claude": cfg.kc_model_claude_override,
+    "codex": cfg.kc_model_codex_override,
+}
+_KC_MODEL_BACKEND_DEFAULT: dict[str, str] = {
+    "kiro": cfg.kc_model_kiro_default,
+    "claude": cfg.kc_model_claude_default,
+    "codex": cfg.kc_model_codex_default,
+}
+
+
+def _resolve_backend_model_override(backend: str) -> str:
+    """Per-backend hard override (``backends.<b>.model.override``), or ''.
+
+    Highest operator-controlled precedence level: when set, every agent on this
+    backend is forced to the named model regardless of per-agent persona config.
+    """
+    return _KC_MODEL_BACKEND_OVERRIDE.get(backend, "")
+
+
+def _resolve_backend_default_model(backend: str) -> str:
+    """Resolve the fallback model for a backend when no per-agent model is set.
+
+    Applies the lower half of the TRN-257 precedence chain:
+      backends.<b>.model.default > model.default > "" (KiroCrew built-in)
+    The caller writes the result as ``agent.default_model`` only when non-empty,
+    leaving KiroCrew's built-in default intact otherwise. A per-agent model in a
+    persona file still wins over this (the gateway treats default_model as a
+    fallback), as does a per-backend override resolved separately.
+    """
+    return _KC_MODEL_BACKEND_DEFAULT.get(backend, "") or KC_MODEL_DEFAULT
 GA_MIN_FREE_MEM_GB = cfg.ga_min_free_mem_gb
 GA_SPAWN_MIN_MEMORY_GB = cfg.ga_spawn_min_memory_gb
 GA_RESOURCE_PRESSURE_GB = cfg.ga_resource_pressure_gb
@@ -240,15 +274,9 @@ GA_PREWARM_ENABLED = True
 # GA_CREW_AGENT is the consolidated backend var (replaces GA_CREW_ACP_BACKEND + GA_AGENT_BACKENDS).
 # The runtime default backend is the first entry.
 GA_CREW_ACP_BACKEND = cfg.ga_crew_agent.split(",")[0].strip().lower()
-# Credentials resolve from Podman secrets exactly as in server.py, so the
-# OAuth-injection guards below see the same values the crew env was built from.
-ANTHROPIC_API_KEY = _security.get_secret(
-    "ga-crew-anthropic-api-key", env_var="ANTHROPIC_API_KEY")
-CLAUDE_CODE_OAUTH_TOKEN = _security.get_secret(
-    "ga-claude-code-oauth-token", env_var="CLAUDE_CODE_OAUTH_TOKEN")
+# Credential globals removed (TRN-233 task 2.1) — launcher.py now calls
+# _cred_store.get(backend) at launch time instead of using module-level reads.
 ANTHROPIC_BASE_URL = cfg.anthropic_base_url
-OPENAI_API_KEY = _security.get_secret(
-    "ga-crew-openai-api-key", env_var="OPENAI_API_KEY")
 OPENAI_BASE_URL = cfg.openai_base_url
 
 # The effective crew session idle timeout. Spec-ops crews are patched with a
@@ -994,9 +1022,16 @@ def _seed_openspec_store(podman: PodmanClient, container: str) -> None:
         logger.warning("openspec init failed for %s: %s", container, e)
 
 
-def _patch_models(podman: PodmanClient, container: str) -> None:
-    """Patch all *.json agent files to KC_MODEL_OVERRIDE if set."""
-    model = KC_MODEL_OVERRIDE
+def _patch_models(podman: PodmanClient, container: str, *, backend: str) -> None:
+    """Hard-patch all *.json agent files to the per-backend model override.
+
+    TRN-257: the override is now per-backend (``backends.<b>.model.override``),
+    resolved for the crew's own ``backend`` (TRN-259).
+    When set, it forces every agent on that backend to the named model — the
+    highest operator-controlled precedence level (``backend_override``), beaten
+    only by a dispatch-time ``model=`` argument. No override set -> no patch.
+    """
+    model = _resolve_backend_model_override(backend)
     if not model:
         return
     try:
@@ -1456,8 +1491,18 @@ def _reconcile_registry() -> None:
     logger.info("Registry reconciled. Live crews: %s", list(snapshot.keys()))
 
 
-def _patch_crew_config(podman: PodmanClient, container: str, composition_entry: dict | None = None) -> None:
+def _patch_crew_config(
+    podman: PodmanClient,
+    container: str,
+    composition_entry: dict | None = None,
+    *,
+    backend: str,
+) -> None:
     """Patch KiroCrew config while the container is running.
+
+    ``backend`` is the crew's own backend (TRN-259): the launch-time choice, or
+    the registry-recorded ``acp_backend`` on restart. It is required so no call
+    site silently falls back to the transport default.
 
     The stopped-crew recovery path calls this immediately after a provisional
     start, before waiting for gateway readiness. Create the destination
@@ -1533,23 +1578,28 @@ def _patch_crew_config(podman: PodmanClient, container: str, composition_entry: 
         "sandbox": "off",
         "sandbox_allow_unsandboxed_exec": True,
     }
-    # When GA_CREW_ACP_BACKEND=claude, write acp_backend into the crew config so
-    # the gateway routes agent spawns through the Claude Code ACP runtime rather
-    # than the kiro-cli runtime.
-    if GA_CREW_ACP_BACKEND == "claude":
+    # For a claude crew, write acp_backend into the crew config so the gateway
+    # routes agent spawns through the Claude Code ACP runtime rather than the
+    # kiro-cli runtime.
+    if backend == "claude":
         agent_overrides["acp_backend"] = "claude"
-    # When GA_CREW_ACP_BACKEND=codex, route agent spawns through the Codex ACP
-    # runtime. codex-acp advertises a verified read-only mode at session/new, so
+    # For a codex crew, route agent spawns through the Codex ACP runtime.
+    # codex-acp advertises a verified read-only mode at session/new, so
     # ghostship's per-call kiro approval gate does not apply (see crew-governance).
-    elif GA_CREW_ACP_BACKEND == "codex":
+    elif backend == "codex":
         agent_overrides["acp_backend"] = "codex"
-    # KC_MODEL_DEFAULT sets agent.default_model — a global fallback that applies
-    # when no per-agent model field overrides it. Precedence (high→low):
-    #   KC_MODEL_OVERRIDE > per-agent model > KC_MODEL_DEFAULT > KiroCrew built-in
-    # Only write the field when the env var is set and non-empty; omitting it
-    # leaves KiroCrew's built-in default intact for existing installs.
-    if KC_MODEL_DEFAULT:
-        agent_overrides["default_model"] = KC_MODEL_DEFAULT
+    # agent.default_model — the fallback model applied when no per-agent model
+    # field overrides it. TRN-257 resolves it per backend:
+    #   backends.<b>.model.default > model.default > KiroCrew built-in
+    # Full precedence chain (high→low):
+    #   dispatch(model=) > backends.<b>.model.override > per-agent model
+    #     > backends.<b>.model.default > model.default > KiroCrew built-in
+    # The per-backend override (if any) is applied separately as a hard patch in
+    # _patch_models. Only write default_model when the resolved fallback is
+    # non-empty; omitting it leaves KiroCrew's built-in default intact.
+    _default_model = _resolve_backend_default_model(backend)
+    if _default_model:
+        agent_overrides["default_model"] = _default_model
 
     # Build the full config override structure passed to patch_crew_config.py.
     # The script deep-merges every top-level key into config.local.json, so
@@ -1718,17 +1768,18 @@ def _inject_policy(
     # 2. Add identity block (without signature yet) and pass everything into
     # the container to sign.  Signing runs inside the container so the
     # canonicalization is always the same version as the verifier.
-    # The policy + policy_signing_key are passed as a single base64-encoded
-    # JSON payload to avoid interpolating the secret as a Python literal.
+    # The policy + policy_signing_key are sent via stdin (not argv) so the
+    # signing key never appears in /proc/<pid>/cmdline (TRN-260/H-1).
     policy["identity"] = {"issuer": "ghostship"}
     payload_b64 = base64.b64encode(
         json.dumps({"policy": policy, "policy_signing_key": policy_signing_key}).encode("utf-8")
     ).decode()
 
     # Signing runs inside the container (see inject_policy.py).
-    result = podman.container_exec_checked(
+    result = podman.container_exec_stdin(
         container,
-        ["python3", f"{SCRIPTS_DIR}/inject_policy.py", KIRO_CREW_DIR, payload_b64],
+        ["python3", f"{SCRIPTS_DIR}/inject_policy.py", KIRO_CREW_DIR],
+        payload_b64.encode("utf-8"),
     )
     logger.info("Injected security policy for %s: %s", container, result.strip())
     return policy_version
@@ -1746,6 +1797,7 @@ def _finish_crew_setup(
     *,
     admiral_secret: str,
     dashboard: bool = False,
+    backend: str,
 ) -> dict:
     """Complete crew setup after auth is confirmed.
 
@@ -1768,6 +1820,7 @@ def _finish_crew_setup(
         composition_entry,
         admiral_secret=admiral_secret,
         dashboard=dashboard,
+        backend=backend,
     )
 
 
@@ -2034,6 +2087,14 @@ def _run_pty_login_flow(
     except Exception as e:
         logger.warning("PTY read error in _run_pty_login_flow: %s", e)
 
+    if not login_url:
+        # Surface what the CLI printed so a stalled prompt is diagnosable from
+        # the transport log alone.
+        tail = _strip_terminal_sequences(
+            collected.decode("utf-8", errors="replace")
+        ).strip()[-500:]
+        logger.warning("Login CLI produced no URL; last output: %r", tail)
+
     if login_url:
         # Hand remaining PTY output to a background daemon thread so the
         # socket drains to EOF without blocking the event loop.
@@ -2068,8 +2129,13 @@ _login_pending: dict | None = None
 _login_pending_lock = threading.Lock()
 
 
-def _initiate_login(podman: "PodmanClient") -> dict:
+def _initiate_login(
+    podman: "PodmanClient", method: str | None = None, provider: dict | None = None
+) -> dict:
     """Start a device auth flow and return login URL and code.
+
+    *method*/*provider* select builder-id or identity-center; see
+    ``KiroLoginFlow.initiate`` for the defaults when they are omitted.
 
     Acquires _login_pending_lock, applies TOCTOU-safe guards, starts the
     ephemeral login container, runs kiro-cli login via PTY, answers interactive
@@ -2088,7 +2154,7 @@ def _initiate_login(podman: "PodmanClient") -> dict:
     except ModuleNotFoundError:
         from transport.login import KIRO_FLOW  # local dev
     global _login_pending, _login_pending_lock
-    result = KIRO_FLOW.initiate(podman)
+    result = KIRO_FLOW.initiate(podman, method=method, provider=provider)
     with _login_pending_lock:
         _login_pending = KIRO_FLOW._pending
     return result
