@@ -3,7 +3,7 @@ name: ghostship-command
 description: Command a ghostship fleet over the `ghostship` MCP server — launch crew containers, seed and extract workspace files, dispatch OpenSpec work to the six agent personas, poll or steer running tasks, run a crew on autopilot via Captain, and tear crews down. Use whenever the `ghostship` MCP tools (crews, launch, supply, evac, dispatch, pickup, steer, captain, schedule, nuke) are available and there's fleet work to do — this skill has no assumed repo context, it is the context.
 metadata:
   author: ghostship
-  version: "0.8.0"
+  version: "0.8.1"
 ---
 
 # Ghostship Command
@@ -412,16 +412,24 @@ By default, each agent commits under its own persona identity (e.g.
 `Ghost <ghost@localhost>`). When you evac and cherry-pick those commits into
 your local repo, the persona labels appear in your history.
 
-**Option 1 — configure upfront (recommended).** Add to your `ghostship.conf`:
+Git identity and Claude attribution are separate. Setting the author identity
+does not control attribution text. Claude crews add no `Co-Authored-By` trailer
+to commits and no "Generated with Claude Code" text to PR descriptions. The
+claude toolchain bakes that setting into the crew image, so no config is needed.
 
-```bash
-GA_GIT_AUTHOR_NAME="Your Name"
-GA_GIT_AUTHOR_EMAIL="you@example.com"
+**Option 1 — configure upfront (recommended).** Add to `config/ghostship.yaml`:
+
+```yaml
+crew:
+  git:
+    author:
+      name: "Your Name"
+      email: "you@example.com"
 ```
 
-Then reinstall (`./install.sh --config ghostship.conf`). All agents in every
-new crew will commit under your identity. Existing crews are not affected —
-nuke and relaunch to pick up the change.
+Then run `ghostship upgrade`. All agents in every new crew will commit under
+your identity. Existing crews are not affected. Relaunch them to pick up the
+change, since they keep the image they launched with.
 
 **Option 2 — rewrite after cherry-pick.** If you've already evac'd commits
 with persona labels, rewrite them in your local repo:

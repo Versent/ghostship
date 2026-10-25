@@ -30,7 +30,7 @@ RUN apt-get update -qq && \
 # to this binary, so it must be present for them to actually work. Pinned to
 # match the version the skills/ SKILL.md files were generated with (see each
 # file's `metadata.generatedBy`) — bumping the skills means bumping this too.
-RUN npm install -g @fission-ai/openspec@1.9.0
+RUN npm install -g @fission-ai/openspec@1.14.3
 
 # Optional agent toolchains (TRN-202). install.sh passes AGENT_TOOLCHAINS: the
 # optional backends listed in GA_AGENT_BACKENDS (kiro is bundled in the base
@@ -52,3 +52,20 @@ LABEL org.ghostship.toolchains=$AGENT_TOOLCHAINS
 
 ARG VERSION=0.0.0-dev
 LABEL org.ghostship.version=$VERSION
+
+# Bake mcteamstar/.agents into the image so AcademyLoader can exec
+# `.agents/setup` at launch time without any network call.
+# Clone runs as root then chowns to kirocrew (D5 in design.md: kirocrew-owned).
+# AGENTS_REF pins to a specific commit — bump deliberately for each .agents update;
+# a changed SHA triggers a cache-less rebuild via the org.ghostship.agents_ref label.
+# Note: git clone --depth 1 --branch requires a branch/tag name, not a raw SHA.
+# To pin to a specific commit, use a tag; for latest use "main".
+ARG AGENTS_URL="https://github.com/mcteamstar/.agents.git"
+ARG AGENTS_REF="main"
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends git && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    git clone --depth 1 --branch "${AGENTS_REF}" "${AGENTS_URL}" /home/kirocrew/.agents && \
+    chown -R kirocrew:kirocrew /home/kirocrew/.agents && \
+    chmod +x /home/kirocrew/.agents/setup
+LABEL org.ghostship.agents_ref=$AGENTS_REF

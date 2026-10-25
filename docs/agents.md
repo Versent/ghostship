@@ -11,7 +11,7 @@ Every ghostship ships the same six KiroCrew agent personas, defined in
 | **Banshee** | Review/fix operative — independent second pass; finds bugs, runs tests, traces to root | explore, propose, update-change, apply-change |
 | **Reaper** | Cleanup operative — closes out finished changes | sync-specs, archive-change |
 | **Wraith** | Recon/docs operative — research and docs writing; read-only over code | explore |
-| **Raven** | Watcher/coordinator — skims mailboxes, checks task state, dispatches bounded next steps. Captain-loop behaviour injected via standing-order template. | dispatch via `kirocrew` CLI + gateway REST API |
+| **Raven** | Watcher/coordinator — skims mailboxes, checks task state, dispatches bounded next steps. Captain-loop behaviour injected via standing-order template. | dispatch via `kirocrew` CLI + `ghostship-spawn` skill |
 
 Tool grants differ per worker. Ghost, Spectre, and Banshee have the full set (`read grep glob write code shell web_search web_fetch`); Reaper has all except `code` (`read grep glob write shell web_search web_fetch`); Wraith has `read grep glob shell web_search web_fetch` (no `write`, no `code`). Raven has `read grep glob shell` only.
 
@@ -20,6 +20,34 @@ The five workers form the OpenSpec cycle: Spectre explores and proposes, Ghost i
 Ghost is the one agent with the full OpenSpec lifecycle (explore through archive), so a well-scoped task is drivable end to end without a hand-off. Banshee gets explore through apply-change — an independent reviewer hands fixes to Reaper to formally close out. Banshee's preferred pattern is to amend the existing change via `openspec-update-change` when the fix fits, or `openspec-propose` when it doesn't.
 
 Small, self-contained work can start and end with a single Ghost. Not every task needs the full cycle.
+
+## Academy delivery (TRN-264)
+
+Academy content — skills, steering docs, and MCP servers — is delivered to the
+backend-native harness paths of every crew via `mcteamstar/.agents`, which is
+baked into every crew image at build time as `/home/kirocrew/.agents`.
+
+At crew launch, `AcademyLoader` stages manifest-selected content into the
+in-container `.agents/` staging directories:
+
+| Content | Staged path | kiro harness | claude harness |
+|:--------|:------------|:-------------|:---------------|
+| Skills | `.agents/skills/<name>/` | `~/.kiro/skills/<name>/` | `~/.claude/skills/<name>/` |
+| Steering | `.agents/context/<name>.md` | `~/.kiro/steering/<name>.md` | `~/.claude/rules/<name>.md` |
+| MCP config | `.agents/mcp/servers.json` | `~/.kiro/mcp.json` | `~/.claude.json` |
+
+After staging, `AcademyLoader` calls `.agents/setup` inside the container with
+no harness argument. Setup detects which harnesses are installed in the image and
+wires the staged content to each one's native paths, whatever the crew's own
+backend.
+New backends (e.g. `codex`, `opencode`) require no ghostship changes — only an
+update to `mcteamstar/.agents/setup`.
+
+**Agent persona JSON** (`academy/agents/*.json`) is delivered directly to
+`~/.kiro/agents/` for every crew, whatever its backend. That directory is
+KiroCrew's persona registry: the gateway reads it on every backend to resolve
+named dispatch (`ghost`, `raven`, ...) and to build each session's persona
+prompt. Without it, a claude or codex crew refuses every named dispatch.
 
 ## Captain
 
@@ -33,7 +61,7 @@ Both forms append the resolved order to `captain@localhost`. `captain(..., actio
 
 `transport://orders` returns a summary index; `transport://orders/{name}` returns the full resolved body.
 
-**Known limitation — Claude and Codex backend crews:** Captain autopilot does not run on non-kiro backend crews. Raven cannot read the crew gateway's local IPC secret that the `sdd` and `independent-review` templates need for dispatching other personas. Drive Claude or Codex crews manually with `dispatch`, `pickup`, and `steer`.
+**Claude-backend support:** Captain autopilot now dispatches through the manifest-delivered `ghostship-spawn` skill, so Raven no longer needs the gateway's local IPC secret. Relaunch an existing crew after upgrading so it receives the helper and refreshed Raven prompt. Manual relay (`dispatch`, `pickup`, `steer`) remains available when an operator intentionally chooses not to run the Captain loop.
 
 ## Steering, not enforcement
 

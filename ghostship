@@ -273,6 +273,28 @@ def cmd_stop(args: list) -> int:
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
+# Compose runs with --project-name ga, so the portal's `ga-portal-data` volume
+# is created as `ga_ga-portal-data`. The bare name covers older installs.
+_PORTAL_DATA_VOLUMES = ("ga_ga-portal-data", "ga-portal-data")
+
+
+def _portal_data_mountpoint(podman: list) -> "str | None":
+    """Return the portal data volume's mountpoint, or None if neither name exists."""
+    import json as _json
+    for name in _PORTAL_DATA_VOLUMES:
+        result = subprocess.run(
+            podman + ["volume", "inspect", name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            continue
+        vols = _json.loads(result.stdout or "[]")
+        if vols:
+            return vols[0].get("Mountpoint", "")
+    return None
+
+
 def cmd_status(args: list) -> int:
     podman = _podman_cmd()
 
@@ -321,26 +343,6 @@ def cmd_status(args: list) -> int:
         print("  Run 'ghostship start' to bring it back up.")
         return 0
 
-    # Parse port bindings from ga-transport. When Caddy (ga-portal) fronts the
-    # transport, the transport has no host port binding — fall back to PORT
-    # (the single Caddy listen port, default 64057).
-    port_str = "unknown"
-    try:
-        ports = json.loads(ports_json)
-        # ports is like {"64057/tcp": [{"HostIp": "127.0.0.1", "HostPort": "64057"}]}
-        for _proto_key, bindings in ports.items():
-            if bindings:
-                host_port = bindings[0].get("HostPort", "")
-                host_ip = bindings[0].get("HostIp", "127.0.0.1")
-                if host_port:
-                    port_str = f"{host_ip}:{host_port}"
-                    break
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        pass
-    if port_str == "unknown":
-        # Transport has no host binding (Caddy is the external listener).
-        port_str = f"localhost:{os.environ.get('PORT', '64057')}"
-
     # Compute uptime
     uptime_str = ""
     if started_at:
@@ -377,8 +379,36 @@ def cmd_status(args: list) -> int:
         except Exception:
             uptime_str = started_at
 
+    # Parse port bindings from ga-transport. When Caddy (ga-portal) fronts the
+    # transport, the transport has no host port binding. Resolution order:
+    #   1. Host port binding (direct listen, no portal)
+    #   2. GA_HOST_URL from container env (set by install.sh — captures remote
+    #      hosts and non-default ports such as port 80 on starport)
+    #   3. localhost:<PORT> fallback
+    port_str = "unknown"
+    host_url = ""
+    try:
+        ports = json.loads(ports_json)
+        # ports is like {"64057/tcp": [{"HostIp": "127.0.0.1", "HostPort": "64057"}]}
+        for _proto_key, bindings in ports.items():
+            if bindings:
+                host_port = bindings[0].get("HostPort", "")
+                host_ip = bindings[0].get("HostIp", "127.0.0.1")
+                if host_port:
+                    port_str = f"{host_ip}:{host_port}"
+                    break
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    if port_str == "unknown":
+        host_url = _inspect_installed_url()
+        if not host_url:
+            port_str = f"localhost:{os.environ.get('PORT', '64057')}"
+
     print("ghostship status: running ✓")
-    print(f"  URL:    http://{port_str}/mcp")
+    if host_url:
+        print(f"  URL:    {host_url}/mcp")
+    else:
+        print(f"  URL:    http://{port_str}/mcp")
     if uptime_str:
         print(f"  Uptime: {uptime_str}")
 
@@ -386,21 +416,18 @@ def cmd_status(args: list) -> int:
     # Portal is always on (GA_PORTAL_ENABLED was removed in TRN-103)
     portal_tls_mode = os.environ.get("GA_PORTAL_TLS_MODE", "internal")
     if portal_tls_mode == "internal":
-        # Try to locate the volume mountpoint for ga-portal-data
         try:
-            import json as _json
-            vol_inspect = subprocess.run(
-                podman + ["volume", "inspect", "ga-portal-data"],
-                capture_output=True,
-                text=True,
-            )
-            if vol_inspect.returncode == 0:
-                vols = _json.loads(vol_inspect.stdout)
-                if vols:
-                    mountpoint = vols[0].get("Mountpoint", "")
-                    cert_path = f"{mountpoint}/caddy/pki/authorities/local/root.crt"
-                    print(f"  Caddy TLS: internal CA (trust once with: podman exec ga-portal caddy trust)")
-                    print(f"  CA cert:   {cert_path}")
+            mountpoint = _portal_data_mountpoint(podman)
+            if mountpoint is not None:
+                cert_path = f"{mountpoint}/caddy/pki/authorities/local/root.crt"
+                print(f"  Caddy TLS: internal CA (trust once with: podman exec ga-portal caddy trust)")
+                print(f"  CA cert:   {cert_path}")
+                # TRN-268: on macOS the mountpoint is inside the Podman VM — print an extraction hint
+                if sys.platform == "darwin":
+                    machine = os.environ.get("GA_MACHINE_NAME", "ghost-academy")
+                    print(f"  (VM path — to extract to host, run:)")
+                    print(f"    podman machine ssh {machine} cat {cert_path} > ~/ghost-academy-root.crt")
+                    print(f"  Then trust: sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/ghost-academy-root.crt")
             else:
                 print("  Caddy TLS: internal CA (ga-portal-data volume not found — run install.sh first)")
         except Exception:
@@ -552,11 +579,42 @@ def _inspect_installed_api_key() -> str:
 
 
 def _find_podman() -> list | None:
-    """Return the podman command list, or None if podman is not available."""
+    """Return the podman command list targeting the right socket/machine, or None.
+
+    Mirrors _podman_cmd() but returns None instead of a bare fallback when
+    podman is not available. Used by _inspect_installed_url and
+    _inspect_installed_api_key, which need to reach the same instance that
+    hosts ga-transport (e.g. the dedicated ghost-academy socket on Linux).
+    """
+    import platform
+
+    base = None
     for cmd in (["podman"], ["podman-remote"]):
         if shutil.which(cmd[0]):
-            return cmd
-    return None
+            base = cmd[0]
+            break
+    if base is None:
+        return None
+
+    # Honour the same dedicated socket/machine logic as _podman_cmd()
+    sock = os.environ.get("PODMAN_SOCK", "")
+    if sock:
+        return [base, "--url", f"unix://{sock}"]
+
+    machine = os.environ.get("GA_MACHINE_NAME", "ghost-academy")
+    dedicated = os.environ.get("GA_DEDICATED_MACHINE", "true").lower() == "true"
+
+    if platform.system() == "Darwin":
+        if dedicated:
+            return [base, "--connection", machine]
+    else:
+        if dedicated:
+            runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            sock_path = f"{runtime}/{machine}/podman.sock"
+            if os.path.exists(sock_path):
+                return [base, "--url", f"unix://{sock_path}"]
+
+    return [base]
 
 
 def _is_safe_url(url: str) -> bool:

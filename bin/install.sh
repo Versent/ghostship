@@ -235,6 +235,11 @@ GA_ORDERS_DIR=""
 GA_TLS_CERTFILE=""
 GA_TLS_KEYFILE=""
 KC_BASE_IMAGE=""
+# Pin for mcteamstar/.agents baked into the crew image (TRN-264). Empty = use
+# the Containerfile default ("main"). Set to a tag or SHA for reproducible
+# builds; a changed value forces a crew image rebuild. Override via
+# machine.images.agents_ref in ghostship.yaml.
+AGENTS_REF=""
 GA_PORTAL_SESSION_TTL_SECS=86400
 GA_RATE_LIMIT_ENABLED=true
 GA_RATE_LIMIT_LOGIN_GET=30:60
@@ -941,6 +946,14 @@ if ${_PODMAN_CMD} image exists localhost/spec-ops:latest 2>/dev/null; then
     echo "  Detected stale localhost/spec-ops:latest version ('$_baked_crew_version' != '${VERSION}-spec-ops') -- forcing a clean rebuild."
     _CREW_BUILD_FLAGS=(--no-cache)
   fi
+  # TRN-264: a changed .agents pin must also trigger a clean rebuild.
+  _baked_agents_ref="$(${_PODMAN_CMD} inspect localhost/spec-ops:latest --format '{{ index .Labels "org.ghostship.agents_ref" }}' 2>/dev/null || true)"
+  [[ "$_baked_agents_ref" == "<no value>" ]] && _baked_agents_ref=""
+  _effective_agents_ref="${AGENTS_REF:-main}"
+  if [[ -n "$_baked_agents_ref" && "$_baked_agents_ref" != "$_effective_agents_ref" ]]; then
+    echo "  .agents pin changed ('${_baked_agents_ref}' -> '${_effective_agents_ref}') -- forcing a clean rebuild."
+    _CREW_BUILD_FLAGS=(--no-cache)
+  fi
 fi
 
 echo "Building localhost/base-admission:latest (admission) ..."
@@ -972,6 +985,7 @@ ${_PODMAN_CMD} build -t localhost/spec-ops-mid:latest \
   "${_CREW_BUILD_FLAGS[@]}" \
   --build-arg VERSION="${VERSION}-spec-ops" \
   --build-arg AGENT_TOOLCHAINS="${AGENT_TOOLCHAINS}" \
+  ${AGENTS_REF:+--build-arg AGENTS_REF="${AGENTS_REF}"} \
   "$GHOSTSHIP_DIR/crews/spec-ops/" \
   && ${_PODMAN_CMD} build -t localhost/spec-ops:latest \
   "${_CREW_BUILD_FLAGS[@]}" \
@@ -1313,14 +1327,26 @@ echo "✓ Caddy initial-config.json written to ${DATA_DIR}/caddy/initial-config.
 if [[ "${GA_PORTAL_TLS_MODE:-off}" == "internal" ]]; then
   # Resolve the host-side volume mountpoint for ga-portal-data.
   _CADDY_DATA_MOUNTPOINT=""
-  if ${_PODMAN_CMD} volume exists ga-portal-data 2>/dev/null; then
-    _CADDY_DATA_MOUNTPOINT="$(${_PODMAN_CMD} volume inspect ga-portal-data --format '{{.Mountpoint}}' 2>/dev/null || true)"
-  fi
+  # Compose's --project-name ga prefixes the volume (ga_ga-portal-data); the
+  # bare name covers older installs.
+  for _portal_vol in ga_ga-portal-data ga-portal-data; do
+    if ${_PODMAN_CMD} volume exists "${_portal_vol}" 2>/dev/null; then
+      _CADDY_DATA_MOUNTPOINT="$(${_PODMAN_CMD} volume inspect "${_portal_vol}" --format '{{.Mountpoint}}' 2>/dev/null || true)"
+      break
+    fi
+  done
+  unset _portal_vol
   _CADDY_ROOT_CERT_PATH="${_CADDY_DATA_MOUNTPOINT:-(ga-portal-data not yet created)}/caddy/pki/authorities/local/root.crt"
   echo ""
   echo "── Caddy internal CA ─────────────────────────────────────────────────"
   echo "TLS mode: internal (Caddy built-in CA)"
   echo "Root CA cert: ${_CADDY_ROOT_CERT_PATH}"
+  # TRN-268: on macOS the mountpoint is inside the Podman VM — print an extraction hint
+  if [[ "$(uname -s)" == "Darwin" ]] && [[ -n "${_CADDY_DATA_MOUNTPOINT}" ]]; then
+    echo "  (VM path — to extract to host, run:)"
+    echo "    podman machine ssh ${_MACHINE:+${_MACHINE} }cat ${_CADDY_ROOT_CERT_PATH} > ~/ghost-academy-root.crt"
+    echo "  Then trust it: sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/ghost-academy-root.crt"
+  fi
   echo ""
   echo "After ga-portal starts, run this once to trust the CA:"
   echo "  podman exec ga-portal caddy trust"

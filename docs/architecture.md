@@ -22,6 +22,12 @@ Every ghostship shares the same foundation: [`academy/agents/`](../academy/agent
 
 Development inside a ghostship follows [OpenSpec](https://github.com/Fission-AI/OpenSpec)'s spec-driven workflow — explore → propose → apply → archive — split across five worker personas. See [agents.md](agents.md) and [Steering](#steering).
 
+### Ghostship-spawn gateway skill
+
+`ghostship-spawn` is an Academy skill copied into every manifest-selected crew with its complete directory, including executable helper scripts. It provides the four gateway operations not covered by the `kirocrew` CLI: named-persona dispatch, task detail, steering, and continuation. The helper sends cookie-authenticated requests only to the crew's fixed loopback gateway; agents do not assemble REST calls or handle the session cookie. Dispatch requests retained runs (`keep=true`) so the returned gateway `id` remains usable for status, steering and continuation. The helper does not follow gateway redirects. Its task input should stay short and describe commands rather than quote literal command lines.
+
+Claude crews run in KiroCrew's `default` mode under its hook gate. KiroCrew does not write `bypassPermissions`; `dangerously_skip_permissions` only approves calls the gate allows and cannot override a gate denial.
+
 ## Crew lifecycle
 
 ```
@@ -98,7 +104,7 @@ For multi-angle review use the `independent-review` template:
 
 `transport://orders` returns a summary index (name + one-line description per template). `transport://orders/{name}` returns the full resolved body. `GA_ORDERS_DIR` lets operators point at custom `.md` templates that merge with and can override `academy/orders/`.
 
-**Known limitation:** Captain autopilot works for kiro-backend crews only. On Claude or Codex backend crews, Raven cannot read the crew gateway's local IPC secret that the `sdd` and `independent-review` templates require for dispatching other personas. Drive non-kiro crews with manual relay (`dispatch`, `pickup`, `steer`) until this is fixed.
+Captain autopilot dispatches through the manifest-delivered `ghostship-spawn` skill, including on Claude-backend crews. Relaunch an existing crew after upgrading so it receives the helper and refreshed Raven prompts; use manual relay (`dispatch`, `pickup`, `steer`) only when an operator intentionally chooses not to run the Captain loop.
 
 ## Steering
 
@@ -168,16 +174,15 @@ Restarting a stopped crew never picks up a rebuilt image — only `nuke` + `laun
 
 ```bash
 ./start.sh                            # auto-discovers config
-./start.sh --config ~/ghostship.conf  # explicit config
+./start.sh --config ~/ghostship.yaml  # explicit config
 ./start.sh --machine-name my-academy  # override machine name
 ```
 
 `start.sh` uses `podman compose up -d` against a Compose file generated at install time at `${DATA_DIR}/compose.yml`.
 
 Config discovery order (first match wins):
-1. `<ghostship-dir>/ghostship.conf`
-2. `~/ghostship.conf`
-3. `~/.config/ghostship/ghostship.conf`
+1. `config/ghostship.yaml` (repo directory)
+2. macOS: `~/Library/Application Support/ghost-academy/ghostship.yaml` / Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/ghost-academy/ghostship.yaml`
 
 On Linux with systemd, `start.sh` uses `systemctl --user start` for the Podman service. Without systemd (WSL) it spawns the service as a background process directly.
 
@@ -224,7 +229,7 @@ ghostship/
 │       ├── EXTERNAL_SKILLS.md
 │       ├── ghostship-admin/   # install, connect, upgrade, tear down
 │       └── ghostship-command/ # drives a connected fleet: launch, dispatch, pickup/steer, Captain, nuke
-├── config/                # example config files (ghostship.conf.example)
+├── config/                # example config files (ghostship.yaml.example)
 ├── crews/                 # crew type definitions
 │   ├── registry.json
 │   ├── _base/
@@ -274,7 +279,7 @@ Policy injection failure is logged but never aborts launch.
 
 When a crew's backend is `claude` (the default via `GA_CREW_AGENT=claude`, or `launch(..., backend="claude")`), the Claude Code ACP server (`claude-agent-acp`) runs inside each crew container instead of `kiro-cli`. This changes the trust model in one important way:
 
-- **KiroCrew's per-call tool approval gate is bypassed.** kiro-cli normally blocks individual tool calls until they are approved by the approval policy (or automatically approved under `dangerously_skip_permissions=true`). `claude-agent-acp` does not route through this gate; all tool calls are executed without a KiroCrew-level checkpoint. Headless auto-approval is achieved via the `CLAUDE_CODE_HEADLESS=1` environment variable injected into crew containers at launch.
+- **Claude tool calls run under KiroCrew's hook gate.** Claude crews use KiroCrew's `default` mode; KiroCrew does not write `bypassPermissions`. The `dangerously_skip_permissions` setting only approves calls that the gate allows and cannot override a gate denial.
 
 - **The signed security policy ceiling is still enforced.** The operator governance policy (`academy/policies/default.json` or a custom template) is HMAC-signed and injected as `security_policy.json` + `admission_policy.json` into every crew at setup time, regardless of backend. The gateway enforces this ceiling and a tampered policy causes a signature mismatch at startup. Crew images are built with `claude-agent-acp` only when `claude` is in `GA_CREW_AGENT`; the transport refuses to start with `claude` as the default backend otherwise, so a crew never starts without it. Without that check it would fail to spawn agents.
 
