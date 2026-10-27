@@ -72,6 +72,28 @@ def _env_float(name: str, default: str) -> float:
 _config_logger = logging.getLogger(__name__)
 
 
+def _parse_trusted_proxy_cidr(raw: str) -> list:
+    """Parse a comma-separated list of CIDR strings into ``ip_network`` objects.
+
+    Returns an empty list when ``raw`` is blank (default — no trusted proxies).
+    Raises ``ConfigError`` if any entry is not a valid CIDR.
+    """
+    if not raw or not raw.strip():
+        return []
+    networks = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            raise ConfigError(
+                f"GA_TRUSTED_PROXY_CIDR contains invalid CIDR {entry!r}"
+            ) from None
+    return networks
+
+
 _CADDY_TLS_MODES: frozenset[str] = frozenset({"internal", "tailscale", "acme", "off"})
 _ACP_BACKEND_VALUES: frozenset[str] = frozenset({"kiro", "claude", "codex"})
 _ALWAYS_ENABLED_BACKEND = "kiro"
@@ -293,9 +315,9 @@ class Config:
     # Upstream base image used for ephemeral containers that only need kiro-cli
     # (e.g. login containers). Must match the FROM pin in
     # crews/_base/admission/Containerfile.
-    # 2026-10-17: bumped insider.4 → v0.9.0 stable. Multi-arch index digest —
-    # resolves correctly on amd64 (starport/Linux) and arm64 (corsair/Mac).
-    kc_base_image: str = "ghcr.io/kirodotdev/kirocrew@sha256:108e6b94890ab6ce390d4f5103b096747a6b8eb51e7d020463641551e71ab94c"
+    # 2026-10-26: bumped v0.9.0 → v0.10.0 stable (TRN-271). Multi-arch index
+    # digest — resolves correctly on amd64 (starport/Linux) and arm64 (corsair/Mac).
+    kc_base_image: str = "ghcr.io/kirodotdev/kirocrew@sha256:b6d0b9a3a666df30d99fcadc6a71ab83cbf4ed1c6521e1b81f0333c5553f3e90"
 
     # ── Crew lifecycle ───────────────────────────────────────────────────────
     ga_max_crews: int = 20
@@ -344,6 +366,17 @@ class Config:
     # ── Transport security ────────────────────────────────────────────────────
     ga_tls_certfile: str = ""
     ga_tls_keyfile: str = ""
+    # Comma-separated list of CIDR blocks whose connections are trusted to
+    # supply an accurate X-Forwarded-For header (H-2 / TRN-272). When empty
+    # (default) XFF is never trusted — safe for loopback-only and direct
+    # deployments. Set to e.g. "10.0.0.0/8,172.16.0.0/12" when operating
+    # behind a load balancer or Caddy on a different host.
+    ga_trusted_proxy_cidr: str = ""
+    # When True (default False), refuse to start when GA_TRANSPORT_SECRET is absent
+    # and the transport bind address is non-loopback. When False, emit a CRITICAL
+    # log but continue (warn-only). Set GA_REQUIRE_SECRET_ON_EXTERNAL_BIND=true
+    # to harden production deployments.
+    ga_require_secret_on_external_bind: bool = False
 
     # ── Caddy reverse proxy ───────────────────────────────────────────────────
     # ga-portal (Caddy) is a required architectural component: it owns the main
@@ -483,7 +516,7 @@ class Config:
                 "PODMAN_SOCKET", "/run/user/1000/podman/podman.sock"
             ),
             kc_image=os.environ.get("KC_IMAGE", "localhost/spec-ops:latest"),
-            kc_base_image=os.environ.get("KC_BASE_IMAGE", "ghcr.io/kirodotdev/kirocrew@sha256:108e6b94890ab6ce390d4f5103b096747a6b8eb51e7d020463641551e71ab94c"),
+            kc_base_image=os.environ.get("KC_BASE_IMAGE", "ghcr.io/kirodotdev/kirocrew@sha256:b6d0b9a3a666df30d99fcadc6a71ab83cbf4ed1c6521e1b81f0333c5553f3e90"),
             ga_max_crews=_env_int("GA_MAX_CREWS", "20"),
             ga_max_active_crews=_env_int("GA_MAX_ACTIVE_CREWS", "3"),
             ga_idle_timeout_secs=_env_int("GA_IDLE_TIMEOUT_SECS", "300"),
@@ -505,6 +538,8 @@ class Config:
             ga_dashboard_default=os.environ.get("GA_DASHBOARD_DEFAULT", "").lower() in ("1", "true", "yes"),
             ga_tls_certfile=os.environ.get("GA_TLS_CERTFILE", "").strip(),
             ga_tls_keyfile=os.environ.get("GA_TLS_KEYFILE", "").strip(),
+            ga_trusted_proxy_cidr=os.environ.get("GA_TRUSTED_PROXY_CIDR", "").strip(),
+            ga_require_secret_on_external_bind=os.environ.get("GA_REQUIRE_SECRET_ON_EXTERNAL_BIND", "").lower() in ("1", "true", "yes"),
             ga_portal_tls_mode=_validate_caddy_tls_mode(
                 os.environ.get("GA_PORTAL_TLS_MODE", "off").strip()
             ),
